@@ -11,7 +11,6 @@ class LayerNorm(nn.LayerNorm):
     Subclass of LayerNorm that casts the input tensor to float32 before performing the normalization, then casts it back to the original type.
     Avoids numerical instability in the normalization process when working with lower precision data types.
     """
-
     def forward(self, x: torch.Tensor):
         original_type = x.dtype
         ret = super().forward(x.type(torch.float32))
@@ -22,7 +21,6 @@ class QuickGELU(nn.Module):
     """
     A faster version of GELU activation function that approximates the original function with a polynomial.
     """
-
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
@@ -173,11 +171,12 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)  # Apply the transformer
         x = x.permute(1, 0, 2)  # Permute back to the original shape
 
-        x = self.ln_post(x[:, 0, :])  # Apply layer normalization to the CLS token
+        x_cls = self.ln_post(x[:, 0, :])  # Apply layer normalization to the CLS token
         if self.proj is not None:
-            x = x @ self.proj  # Dot product for mapping the embeddings to the output dimension in the projection layer
+            x_proj = x_cls @ self.proj  # Dot product for mapping the embeddings to the output dimension in the projection layer
+            return x_proj, x_cls
 
-        return x
+        return x_cls, x_cls
 
 
 class CLIP(nn.Module):
@@ -194,11 +193,16 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,  # hidden dimension of the transformer model for text
                  transformer_heads: int,  # number of attention heads in the transformer model for text
-                 transformer_layers: int
+                 transformer_layers: int,
+                 num_medical_concepts: int = 14,
+                 extended_context_length: int = 248,
+                 load_from_clip: bool = False,
                  ):
         super().__init__()
 
         self.context_length = context_length
+        self.extended_context_length = extended_context_length
+        self.num_medical_concepts = num_medical_concepts
 
         if isinstance(vision_layers, int):
             # ViT initialization
@@ -224,13 +228,32 @@ class CLIP(nn.Module):
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
-        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
+
+        if not load_from_clip:
+            self.positional_embedding = nn.Parameter(torch.empty(self.extended_context_length, transformer_width))
+            self.positional_embedding_res = nn.Parameter(torch.empty(self.extended_context_length, transformer_width))
+        else:
+            self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
+
         self.ln_final = LayerNorm(transformer_width)
 
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+        self.medical_concept_classifier = nn.Sequential(
+            nn.Linear(vision_width, transformer_width),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(transformer_width, num_medical_concepts)
+        )
+        self.concept_embedding = nn.Parameter(torch.empty(num_medical_concepts, embed_dim))
+
         self.initialize_parameters()
+
+        self.mask1 = torch.zeros([self.extended_context_length, 1])
+        self.mask1[:20, :] = 1
+        self.mask2 = torch.zeros([self.extended_context_length, 1])
+        self.mask2[20:, :] = 1
 
     def initialize_parameters(self):
         """
@@ -243,6 +266,13 @@ class CLIP(nn.Module):
         """
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
+
+        nn.init.normal_(self.concept_embedding, std=0.01)
+        for m in self.medical_concept_classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
@@ -257,9 +287,10 @@ class CLIP(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # causal attention mask to prevent attending to future tokens
-        # fills the upper triangular part of the matrix with -inf for masked positions
-        mask = torch.empty(self.context_length, self.context_length)
+        """
+        Causal attention mask to prevent attending to future tokens. Fills the upper triangular part of the matrix with -inf for masked positions'
+        """
+        mask = torch.empty(self.extended_context_length, self.extended_context_length)
         mask.fill_(float('-inf'))
         mask.triu_(1)
         return mask
@@ -269,41 +300,89 @@ class CLIP(nn.Module):
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+        """
+        Encode the image and return both the projected embeddings and raw features from the CLS token.
+        """
+        proj_features, cls_features = self.visual(image.type(self.dtype))
+        return proj_features, cls_features
 
-    def encode_text(self, text):
+    def encode_text(self, text, full: bool = False):
+        """
+        Encode the text and return the projected embeddings.
+        """
         x = self.token_embedding(text).type(self.dtype) # initial shape of (batch_size, context_length, d_model)
 
-        x = x + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2) # shape of (context_length, batch_size, d_model)
+        if hasattr(self, 'positional_embedding_res'):
+            x = x + self.positional_embedding.type(self.dtype) * self.mask1.to(x.device).type(self.dtype).to(x.device) + (self.positional_embedding_res.to(x.device) * self.mask2.to(x.device)).type(self.dtype).to(x.device)
+        else:
+            x = x + self.positional_embedding.type(self.dtype)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND: shape of (context_length, batch_size, d_model)
         x = self.transformer(x)
-        x = x.permute(1, 0, 2) # reorder back to original shape
+        x = x.permute(1, 0, 2)  # LND -> NLD: reorder back to original shape
         x = self.ln_final(x).type(self.dtype)
 
         # take the features from the EOS (end of sequence) token embedding and project them to the shared multimodal space output dimension
         # the last token is used as it captures the entire sequence meaning
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        if not full:
+            x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x
 
-    def forward(self, image, text):
-        image_features = self.encode_image(image)
+    def predict_medical_concepts(self, cls_features):
+        """
+        Predict medical concepts from the visual features.
+        """
+        return self.medical_concept_classifier(cls_features)
+
+    def get_concepts_embeddings(self, medical_concepts):
+        """
+        Get concept-aware embeddings based on the medical concept labels from CheXpert.
+        :param medical_concepts: tensor of shape [batch_size, num_medical_concepts] containing 0/1/-1 labels
+                                ( 0: not present, 1: present, -1: uncertain)
+        :return: concept_embeddings: tensor of shape [batch_size, embed_dim]
+        """
+        concept_weights = medical_concepts.clone()
+        concept_weights[concept_weights == -1] = 0.5 # uncertain labels are treated as half present with a softer weight
+
+        weighted_concepts = torch.matmul(concept_weights, self.concept_embedding) # [batch_size, num_concepts] @ [num_concepts, embed_dim] -> [batch_size, embed_dim]
+        weighted_concepts = weighted_concepts / (weighted_concepts.norm(dim=-1, keepdim=True) + 1e-8) # normalize to ensure they have unit length
+        return weighted_concepts
+
+    def forward(self, image, text, medical_concepts=None):
+        image_features, cls_features = self.encode_image(image)
         text_features = self.encode_text(text)
+        concepts_logits = self.predict_medical_concepts(cls_features)
 
         # feature vectors normalized to have a unit length (L2 normalization)
         # ensures cosine similarity is calculated purely based on the angle between the vectors and not their magnitudes
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        image_features_norm = image_features / (image_features.norm(dim=-1, keepdim=True) + 1e-8)
+        text_features_norm = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-8)
 
         # learnable parameters that adjusts the scale of the logits (similarity scores)
         logit_scale = self.logit_scale.exp()
         # similarity matrix where each entry represents the cosine similarity between an image and a text pair
-        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_image = logit_scale * image_features_norm @ text_features_norm.t()
         # transpose the similarity matrix to get the similarity scores for each text compared to an image in the batch
         logits_per_text = logits_per_image.t()
 
-        return logits_per_image, logits_per_text
+        outputs = {
+            "logits_per_image": logits_per_image,  # image-to-text similarity
+            "logits_per_text": logits_per_text,  # text-to-image similarity
+            "image_features": image_features,  # projected image features
+            "text_features": text_features,  # projected text features
+            "concepts_logits": concepts_logits,  # predicted medical concepts
+        }
 
+        if medical_concepts is not None:
+            concepts_embeddings = self.get_concepts_embeddings(medical_concepts)
+            concepts_embeddings_norm = concepts_embeddings / (concepts_embeddings.norm(dim=-1, keepdim=True) + 1e-8)
+
+            concepts_image_similarity = logit_scale * concepts_embeddings_norm @ image_features_norm.t()
+            outputs["concepts_embeddings"] = concepts_embeddings
+            outputs["concepts_image_similarity"] = concepts_image_similarity
+
+        return outputs
 
 def convert_weights(model: nn.Module):
     """
@@ -331,7 +410,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict):
+def build_model(state_dict: dict, load_from_clip: bool = True):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -354,7 +433,8 @@ def build_model(state_dict: dict):
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
+        load_from_clip=load_from_clip
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
@@ -362,5 +442,8 @@ def build_model(state_dict: dict):
             del state_dict[key]
 
     convert_weights(model)
-    model.load_state_dict(state_dict)
-    return model.eval()
+    model_dict = model.state_dict()
+    pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(state_dict, strict=False)
+    return model.train()

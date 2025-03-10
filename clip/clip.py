@@ -4,6 +4,7 @@ import hashlib
 import warnings
 import urllib.request
 
+from torch import nn
 from PIL import Image
 from tqdm import tqdm
 from packaging import version
@@ -16,15 +17,17 @@ from .tokenizer import BpeTokenizer as _Tokenizer
 
 try:
     from torchvision.transforms import InterpolationMode
+
     BICUBIC = InterpolationMode.BICUBIC
 except ImportError:
     from torchvision.transforms import InterpolationMode
+
     BICUBIC = Image.Resampling.BICUBIC
 
 if version.parse(torch.__version__) < version.parse("1.7.1"):
     warnings.warn("PyTorch version 1.7.1 or higher is recommended")
 
-__all__ = ["available_models", "tokenize", "load",]
+__all__ = ["load", "tokenize", "available_models"]
 _tokenizer = _Tokenizer()
 
 _MODELS = {
@@ -39,8 +42,10 @@ _MODELS = {
     "ViT-L/14@336px": "https://openaipublic.azureedge.net/clip/models/3035c92b350959924f9f00213499208652fc7ea050643e8b385c2dac08641f02/ViT-L-14-336px.pt",
 }
 
+
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
+
 
 def _transform(n_px):
     return Compose([
@@ -51,49 +56,24 @@ def _transform(n_px):
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
     ])
 
-def _download(url: str, root: str):
-    os.makedirs(root, exist_ok=True)
-    filename = os.path.basename(url)
-
-    expected_sha256 = url.split("/")[-2]
-    download_target = os.path.join(root, filename)
-
-    if os.path.exists(download_target) and not os.path.isfile(download_target):
-        raise RuntimeError(f"{download_target} exists but is not a regular file!")
-
-    if os.path.isfile(download_target):
-        if hashlib.sha256(open(download_target, "rb").read()).hexdigest() == expected_sha256:
-            return download_target
-        else:
-            warnings.warn(f"{download_target} exists but the SHA256 checksum doesnt not match; Re-downloading the file...")
-
-    with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
-        with tqdm(total=int(source.info().get("Content-Length")), ncols=90, unit='iB', unit_scale=True, unit_divisor=1024) as loop:
-            while True:
-                buffer = source.read(8192)
-                if not buffer:
-                    break
-
-                output.write(buffer)
-                loop.update(len(buffer))
-
-    if hashlib.sha256(open(download_target, "rb").read()).hexdigest() != expected_sha256:
-        raise RuntimeError("Model has been downloaded but the SHA256 checksum does not match!")
-
-    return download_target
 
 def available_models() -> List[str]:
     return list(_MODELS.keys())
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False) -> torch.Tensor:
+
+def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False, extended_context: bool = True) -> torch.Tensor:
     """
     Returns the tokenized representation of given input string(s).
 
     :param texts: input string or a list of input string to tokenize
     :param context_length: context length to use; CLIP models use 77 as default
     :param truncate: whether to truncate the text in case its encoding is longer than the context length
+    :param extended_context: whether to extend the positional embeddings to support longer text sequences
     :return: two-dimensional tensor containing the resulting tokens with the shape = [number of input strings, context_length]
     """
+    if extended_context:
+        context_length = 248
+
     if isinstance(texts, str):
         texts = [texts]
 
@@ -118,7 +98,13 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
     return result
 
 
-def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
+def load(
+        name: str,
+        device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
+        jit: bool = False,
+        download_root: str = None,
+        load_from_clip: bool = True
+):
     """
     Loads a pretrained CLIP model with the chosen architecture.
 
@@ -126,13 +112,82 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     :param device: device to load the model onto
     :param jit: whether to load the optimized JIT model or the original state_dict
     :param download_root: path to download the model files; defaults to ~/.cache/clip
+    :param load_from_clip: load a pre-trained model from the official OpenAI repository
     """
-    if name in _MODELS:
-        model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
-    elif os.path.isfile(name):
-        model_path = name
+
+    def _download(url: str, root: str):
+        os.makedirs(root, exist_ok=True)
+        filename = os.path.basename(url)
+
+        expected_sha256 = url.split("/")[-2]
+        download_target = os.path.join(root, filename)
+
+        if os.path.exists(download_target) and not os.path.isfile(download_target):
+            raise RuntimeError(f"{download_target} exists but is not a regular file!")
+
+        if os.path.isfile(download_target):
+            if hashlib.sha256(open(download_target, "rb").read()).hexdigest() == expected_sha256:
+                return download_target
+            else:
+                warnings.warn(
+                    f"{download_target} exists but the SHA256 checksum doesnt not match; Re-downloading the file...")
+
+        with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
+            with tqdm(total=int(source.info().get("Content-Length")), ncols=90, unit='iB', unit_scale=True,
+                      unit_divisor=1024) as loop:
+                while True:
+                    buffer = source.read(8192)
+                    if not buffer:
+                        break
+
+                    output.write(buffer)
+                    loop.update(len(buffer))
+
+        if hashlib.sha256(open(download_target, "rb").read()).hexdigest() != expected_sha256:
+            raise RuntimeError("Model has been downloaded but the SHA256 checksum does not match!")
+
+        return download_target
+
+    def _extend_positional_embeddings(positional_embedding_pre, keep_len=20):
+        """
+        Extend CLIP's positional embeddings to support longer text sequences.
+
+        :param positional_embedding_pre: original positional embeddings
+        :param keep_len: number of initial embeddings to keep unchanged. See: https://arxiv.org/abs/2403.15378
+        :return: torch.Tensor: extended positional embeddings
+        """
+        length, dim = positional_embedding_pre.shape
+        # new extended embedding shape (4x longer)
+        positional_embedding_res = torch.zeros([4 * length - 3 * keep_len, dim], dtype=model.dtype)
+        # preserve first `keep_len` positions
+        positional_embedding_res[:keep_len] = positional_embedding_pre[:keep_len]
+        # interpolate for extended positions
+        for i in range(length - 1 - keep_len):
+            start_idx = 4 * i + keep_len
+            positional_embedding_res[start_idx] = positional_embedding_pre[i + keep_len]
+            positional_embedding_res[start_idx + 1] = 3 * positional_embedding_pre[i + keep_len] / 4 + 1 * \
+                                                      positional_embedding_pre[i + 1 + keep_len] / 4
+            positional_embedding_res[start_idx + 2] = 2 * positional_embedding_pre[i + keep_len] / 4 + 2 * \
+                                                      positional_embedding_pre[i + 1 + keep_len] / 4
+            positional_embedding_res[start_idx + 3] = 1 * positional_embedding_pre[i + keep_len] / 4 + 3 * \
+                                                      positional_embedding_pre[i + 1 + keep_len] / 4
+        # extend final position smoothly
+        last_idx = 4 * length - 3 * keep_len - 4
+        for j in range(4):
+            positional_embedding_res[last_idx + j] = positional_embedding_pre[length - 1] + j * (
+                    positional_embedding_pre[length - 1] - positional_embedding_pre[length - 2]) / 4
+
+        return positional_embedding_res
+
+    if load_from_clip:
+        if name in _MODELS:
+            model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
+        elif os.path.isfile(name):
+            model_path = name
+        else:
+            raise RuntimeError(f"Model {name} not found; Available models = {available_models()}")
     else:
-        raise RuntimeError(f"Model {name} not found; Available models = {available_models()}")
+        model_path = name
 
     with open(model_path, "rb") as opened_file:
         try:
@@ -145,12 +200,20 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
             state_dict = torch.load(model_path, map_location="cpu")
 
     if not jit:
-        model = build_model(state_dict or model.state_dict()).to(device)
+        model = build_model(state_dict or model.state_dict(), load_from_clip).to(device)
+
+        if load_from_clip:
+            positional_embedding_pre = model.positional_embedding.type(model.dtype)
+            positional_embedding_resized = _extend_positional_embeddings(positional_embedding_pre, keep_len=20)
+
+            model.positional_embedding = nn.Parameter(positional_embedding_resized, requires_grad=False)
+            model.positional_embedding_res = nn.Parameter(positional_embedding_resized.clone(), requires_grad=True)
+
         if str(device) == "cpu":
             model.float()
         return model, _transform(model.visual.input_resolution)
 
-    # patch the device names
+        # patch the device names
     device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])
     device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
 
@@ -209,4 +272,3 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         model.float()
 
     return model, _transform(model.input_resolution.item())
-
