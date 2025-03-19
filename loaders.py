@@ -2,6 +2,7 @@ import torch
 
 from clip import tokenize
 from torch.utils.data import DataLoader
+from datasets import IUXrayDataset
 
 class CxrDataLoader(DataLoader):
     def __init__(self, args, split, transform=None):
@@ -15,8 +16,8 @@ class CxrDataLoader(DataLoader):
         self.transform = transform
 
         if self.dataset_name == 'iu-xray':
-            from datasets import IUXrayDataset
-            self.dataset = IUXrayDataset(self.args, split, transform)
+            split_path = f'iu_xray_{self.split}.csv'
+            self.dataset = IUXrayDataset(self.args, split_path, transform)
         else:
             raise ValueError('Dataset not supported')
 
@@ -46,7 +47,7 @@ class CxrDataLoader(DataLoader):
             'uid': uid_batch,
             'text_tokens': tokenized_texts_batch,
             'image': image_batch,
-            'attention_mask': mask_batch,
-            'medical_concepts': label_batch
+            'attn_mask': mask_batch,
+            'labels': label_batch
         }
 

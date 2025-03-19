@@ -1,49 +1,38 @@
 import os
 import torch
 import pandas as pd
+import numpy as np
 
 from PIL import Image
 from torch.utils.data import Dataset
 
-BASE_PATH = '/Volumes/T7 Shield/datasets/iu-xray'
-LABELS_PATH = os.path.join(BASE_PATH, 'indiana_labels.csv')
-REPORTS_PATH = os.path.join(BASE_PATH, 'indiana_reports.csv')
-IMAGES_PATH = os.path.join(BASE_PATH, 'images/images_normalized')
-PROJECTIONS_PATH = os.path.join(BASE_PATH, 'indiana_projections.csv')
+ROOT_PATH = '/Volumes/T7 Shield/datasets/iu-xray'
+IMAGES_PATH = os.path.join(ROOT_PATH, 'images/images_normalized')
+LABELS = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion', 'Lung Opacity', 'No Finding', 'Pleural Effusion', 'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices']
 
 class IUXrayDataset(Dataset):
-    def __init__(self, args, split, transform=None):
-        self.reports = pd.read_csv(REPORTS_PATH)
-        self.labels = pd.read_csv(LABELS_PATH)
-        self.projections = pd.read_csv(PROJECTIONS_PATH)
-
-        self.split = split
+    def __init__(self, args, split_path, transform=None):
+        self.args = args
+        self.dataset = pd.read_csv(os.path.join(ROOT_PATH, "processed", split_path))
         self.transform = transform
 
-        self.labels.fillna(0, inplace=True)
-
     def __len__(self):
-        return len(self.reports)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        report = self.reports.iloc[idx]
-        uid = report['uid']
+        entry = self.dataset.iloc[idx]
+        uid = entry['uid']
 
-        text = str(report['impression']) + ' ' + str(report['findings'])
+        # text = str(entry['impression']) + ' ' + str(entry['findings'])
+        text = str(entry['report'])
+        labels_array = entry[LABELS].to_numpy(dtype=np.float32)
+        labels = torch.tensor(labels_array, dtype=torch.float).squeeze(0)
+        labels = torch.where(labels == -1, torch.tensor(0.0), labels)
 
-        labels = self.labels[(self.labels['uid'] == uid)]
-        if labels.empty:
-            values = torch.zeros(14, dtype=torch.float)
-        else:
-            values = torch.tensor(labels.iloc[:, 2:].values, dtype=torch.float).squeeze(0)
 
-        proj_path = self.projections[(self.projections['uid'] == uid) & (self.projections['projection'] == 'Frontal')]
-
-        if proj_path.empty:
-            return None
-
-        image = Image.open(os.path.join(IMAGES_PATH, proj_path.iloc[0]['filename'])).convert('RGB')
+        proj_path = entry['frontal_filename'] if pd.notna(entry['frontal_filename']) else entry['lateral_filename']
+        image = Image.open(os.path.join(IMAGES_PATH, proj_path)).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
-        return uid, text, image, values
+        return uid, text, image, labels

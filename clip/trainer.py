@@ -158,14 +158,11 @@ class CLIPTrainer:
         for epoch in range(epochs):
             self.epoch = epoch
             self.logger.info(f"Starting epoch {epoch + 1}/{epochs}")
+
             epoch_loss = 0.0
             epoch_start_time = time.time()
 
             for batch_idx, batch in enumerate(tqdm(self.train_loader)):
-                # skip corrupt or incomplete batches
-                if batch is None:
-                    continue
-
                 if self.global_step >= self.max_steps:
                     self.logger.info(f"Reached maximum steps {self.max_steps}. Stopping training.")
                     break
@@ -208,10 +205,10 @@ class CLIPTrainer:
     def train_step(self, batch):
         images = batch['image'].to(self.device)
         text_tokens = batch['text_tokens'].to(self.device)
-        medical_concepts = batch['medical_concepts'].to(self.device)
+        medical_concepts = batch['labels'].to(self.device)
 
         # get attention mask if available
-        # attention_mask = batch['attention_mask']
+        # attention_mask = batch['attn_mask']
         # if attention_mask is not None:
         #     attention_mask = attention_mask.to(self.device)
 
@@ -284,9 +281,9 @@ class CLIPTrainer:
 
             images = batch['image'].to(self.device)
             text_tokens = batch['text_tokens'].to(self.device)
-            medical_concepts = batch['medical_concepts'].to(self.device)
+            medical_concepts = batch['labels'].to(self.device)
 
-            # attention_mask = batch['attention_mask']
+            # attention_mask = batch['attn_mask']
             # if attention_mask is not None:
             #     attention_mask = attention_mask.to(self.device)
 

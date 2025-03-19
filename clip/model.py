@@ -200,6 +200,9 @@ class CLIP(nn.Module):
                  ):
         super().__init__()
 
+        self.vision_width = vision_width
+        self.transformer_width = transformer_width
+
         self.context_length = context_length
         self.extended_context_length = extended_context_length
         self.num_medical_concepts = num_medical_concepts
