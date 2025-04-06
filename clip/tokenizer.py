@@ -146,7 +146,7 @@ class CLIPTokenizer(object):
         self.sot_token = self.bpe.encoder['<|startoftext|>']
         self.eot_token = self.bpe.encoder['<|endoftext|>']
 
-    def encode(self, texts: Union[str, List[str]], context_length: int = CLIP_CONTEXT_LENGTH, truncate: bool = True, extended_context: bool = True):
+    def encode(self, texts: Union[str, List[str]], context_length: int = CLIP_CONTEXT_LENGTH, truncate: bool = True, extended_context: bool = False):
         if extended_context:
             context_length = CLIP_EXTENDED_CONTEXT_LENGTH
 

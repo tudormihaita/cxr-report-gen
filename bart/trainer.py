@@ -1,211 +1,149 @@
-import os
 import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
+
 from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import accuracy_score, f1_score
+from transformers import get_linear_schedule_with_warmup, AutoTokenizer
 
 
-class VisionTextTrainer:
-    """
-    Trainer class for end-to-end Vision-Text model
-    """
-
+class VisionBartTrainer:
     def __init__(
-            self,
-            model,
-            train_dataloader,
-            val_dataloader,
-            tokenizer,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            output_dir="./checkpoints",
-            learning_rate=5e-5,
-            weight_decay=0.01,
-            warmup_steps=1000,
-            max_grad_norm=1.0,
-            num_epochs=10,
-            logging_steps=100,
-            save_steps=1000,
+        self,
+        model,
+        train_loader,
+        val_loader=None,
+        lr=3e-5,
+        weight_decay=0.01,
+        num_epochs=5,
+        warmup_ratio=0.2,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        max_position_embeddings=128,
+        max_grad_norm=1.0,
+        model_name="facebook/bart-base",
     ):
+        """
+        Custom trainer for XRGenModel.
+
+        :param model (XRGenModel): Your XRGenModel instance.
+        :param tokenizer (AutoTokenizer): Tokenizer matching model.decoder_model_name.
+        :param train_loader (DataLoader): DataLoader with 'image' and 'report' among other keys.
+        :param val_loader (DataLoader, optional): DataLoader for validation (same structure).
+        :param lr (float): Learning rate for AdamW.
+        :param num_epochs (int): Number of training epochs.
+        :param warmup_ratio (float): Fraction of total steps for linear warmup.
+        :param device (str): 'cuda' or 'cpu'.
+        """
         self.model = model
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
-        self.tokenizer = tokenizer
-        self.device = device
-        self.output_dir = output_dir
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
-        self.max_grad_norm = max_grad_norm
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.lr = lr
         self.num_epochs = num_epochs
-        self.logging_steps = logging_steps
-        self.save_steps = save_steps
+        self.warmup_ratio = warmup_ratio
+        self.device = device
+        self.max_position_embeddings = max_position_embeddings
+        self.max_grad_norm = max_grad_norm
 
-        self.model.to(self.device)
+        self.model = self.model.to(self.device)
+        self.model.train()
 
-        os.makedirs(output_dir, exist_ok=True)
+        total_steps = len(self.train_loader) * self.num_epochs
 
-    def train(self):
-        # prepare optimizer and scheduler
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.model.named_parameters()
-                           if not any(nd in n for nd in no_decay) and p.requires_grad],
-                "weight_decay": self.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.model.named_parameters()
-                           if any(nd in n for nd in no_decay) and p.requires_grad],
-                "weight_decay": 0.0,
-            },
-        ]
-
-        optimizer = optim.AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
-
-        total_steps = len(self.train_dataloader) * self.num_epochs
-
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.warmup_steps,
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=weight_decay)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(total_steps * self.warmup_ratio),
             num_training_steps=total_steps
         )
 
-        loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
+    def train(self):
         global_step = 0
-        best_val_loss = float('inf')
 
         for epoch in range(self.num_epochs):
+            print(f"\nEpoch: {epoch+1}/{self.num_epochs}")
+            total_loss = 0.0
+
             self.model.train()
-            epoch_loss = 0
+            for step, batch in enumerate(tqdm(self.train_loader)):
 
-            progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
+                pixel_values = batch["image"].to(self.device)
+                textual_reports = list(batch["report"])  # raw text
 
-            for batch in progress_bar:
-                images = batch["images"].to(self.device)
-                input_ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
+                if max(len(self.tokenizer.encode(text)) for text in textual_reports) > self.max_position_embeddings:
+                    print(f"Warning: Some reports exceed {self.max_position_embeddings} tokens and will be truncated")
+
+                encoded_text = self.tokenizer(
+                    textual_reports,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=self.max_position_embeddings,
+                    return_tensors="pt"
+                ).to(self.device)
+
+                decoder_input_ids = encoded_text["input_ids"]
+                decoder_attention_mask = encoded_text["attention_mask"]
 
                 # forward pass
                 outputs = self.model(
-                    image=images,
-                    decoder_input_ids=input_ids[:, :-1],  # remove EOS for input
-                    decoder_attention_mask=attention_mask[:, :-1],
+                    pixel_values=pixel_values,
+                    labels=decoder_input_ids
                 )
+                loss = outputs.loss
 
-                # calculate loss
-                # shift labels (teacher forcing)
-                shifted_labels = labels[:, 1:]  # remove BOS for target
-
-                # reshape logits and labels for loss calculation
-                logits_flat = outputs.view(-1, outputs.size(-1))
-                labels_flat = shifted_labels.view(-1)
-
-                loss = loss_fn(logits_flat, labels_flat)
-
-                # backward pass
+                self.optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
 
-                # CLIP gradients
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-                # update weights
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                epoch_loss += loss.item()
-                progress_bar.set_postfix({"loss": epoch_loss / (global_step % len(self.train_dataloader) + 1)})
-
+                total_loss += loss.item()
                 global_step += 1
-                if global_step % self.logging_steps == 0:
-                    print(f"Epoch: {epoch + 1}/{self.num_epochs}, Step: {global_step}, Loss: {loss.item()}")
 
-                # save checkpoint
-                if global_step % self.save_steps == 0:
-                    self.save_model(os.path.join(self.output_dir, f"checkpoint-{global_step}"))
+                if (step + 1) % 50 == 0:
+                    avg_loss = total_loss / (step + 1)
+                    print(f" Step [{step+1}/{len(self.train_loader)}], Loss: {avg_loss:.4f}")
 
-            # validation
-            val_loss, val_metrics = self.evaluate()
-            print(f"Validation Loss: {val_loss}, Metrics: {val_metrics}")
+            epoch_loss = total_loss / (len(self.train_loader) if len(self.train_loader) > 0 else 1)
+            print(f"Epoch {epoch+1} finished. Average Training Loss = {epoch_loss:.4f}")
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_model(os.path.join(self.output_dir, "best_model"))
+            if self.val_loader is not None:
+                self.evaluate()
 
-            self.save_model(os.path.join(self.output_dir, f"epoch-{epoch + 1}"))
+        print("Training complete!")
 
-        self.save_model(os.path.join(self.output_dir, "final_model"))
-
-        return global_step, epoch_loss / len(self.train_dataloader)
-
+    @torch.no_grad()
     def evaluate(self):
         self.model.eval()
-        val_loss = 0
-        all_preds = []
-        all_labels = []
+        total_val_loss = 0.0
+        steps = 0
 
-        loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+        for batch in self.val_loader:
+            if batch is None:
+                continue
 
-        with torch.no_grad():
-            for batch in tqdm(self.val_dataloader, desc="Validation"):
-                images = batch["images"].to(self.device)
-                input_ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
+            pixel_values = batch["image"].to(self.device)
+            textual_reports = list(batch["report"])
 
-                outputs = self.model(
-                    image=images,
-                    decoder_input_ids=input_ids[:, :-1],
-                    decoder_attention_mask=attention_mask[:, :-1],
-                )
+            encoded_text = self.tokenizer(
+                textual_reports,
+                padding=True,
+                truncation=True,
+                max_length=self.max_position_embeddings,
+                return_tensors="pt"
+            ).to(self.device)
 
-                shifted_labels = labels[:, 1:]
-                logits_flat = outputs.view(-1, outputs.size(-1))
-                labels_flat = shifted_labels.view(-1)
+            input_ids = encoded_text["input_ids"]
+            attention_mask = encoded_text["attention_mask"]
 
-                loss = loss_fn(logits_flat, labels_flat)
-                val_loss += loss.item()
+            outputs = self.model(
+                pixel_values=pixel_values,
+                labels=input_ids
+            )
+            total_val_loss += outputs.loss.item()
+            steps += 1
 
-                preds = torch.argmax(outputs, dim=-1)
-
-                all_preds.extend(preds.detach().cpu().numpy().tolist())
-                all_labels.extend(shifted_labels.detach().cpu().numpy().tolist())
-
-        # calculate metrics
-        # TODO: improve metrics
-        metrics = {
-            "accuracy": accuracy_score(
-                [l for l in all_labels if l != self.tokenizer.pad_token_id],
-                [p for p, l in zip(all_preds, all_labels) if l != self.tokenizer.pad_token_id]
-            ),
-        }
-
-        return val_loss / len(self.val_dataloader), metrics
-
-    def save_model(self, path):
-        os.makedirs(path, exist_ok=True)
-
-        torch.save(self.model.state_dict(), os.path.join(path, "model.pt"))
-        self.tokenizer.save_pretrained(path)
-        config = {
-            "hidden_size": self.model.config.hidden_size,
-            "vocab_size": self.model.config.vocab_size,
-            "decoder_layers": self.model.config.decoder_layers,
-            "decoder_attention_heads": self.model.config.decoder_attention_heads,
-            "max_position_embeddings": self.model.config.max_position_embeddings,
-        }
-
-        import json
-        with open(os.path.join(path, "config.json"), "w") as f:
-            json.dump(config, f)
-
-    def load_model(self, path):
-        # load model from checkpoint
-        self.model.load_state_dict(torch.load(os.path.join(path, "model.pt")))
-        return self.model
+        avg_val_loss = total_val_loss / steps if steps > 0 else 0.0
+        print(f"[Validation] Average Loss = {avg_val_loss:.4f}")
+        self.model.train()

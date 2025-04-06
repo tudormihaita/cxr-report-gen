@@ -6,6 +6,7 @@ from torch import nn
 from typing import Tuple, Union
 from collections import OrderedDict
 
+from constants import *
 from classifier.model import ChexpertConceptClassifier
 
 
@@ -204,13 +205,14 @@ class CLIP(nn.Module):
                  transformer_layers: int,
                  num_medical_concepts: int = 14,
                  extended_context_length: int = 248,
-                 load_from_clip: bool = False,
+                 extended_context: bool = False,
                  ):
         super().__init__()
 
         self.vision_width = vision_width
         self.transformer_width = transformer_width
 
+        self.extended_context = extended_context
         self.context_length = context_length
         self.extended_context_length = extended_context_length
         self.num_classes = num_medical_concepts
@@ -240,7 +242,7 @@ class CLIP(nn.Module):
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
 
-        if not load_from_clip:
+        if self.extended_context:
             self.positional_embedding = nn.Parameter(torch.empty(self.extended_context_length, transformer_width))
             self.positional_embedding_res = nn.Parameter(torch.empty(self.extended_context_length, transformer_width))
         else:
@@ -297,7 +299,8 @@ class CLIP(nn.Module):
         """
         Causal attention mask to prevent attending to future tokens. Fills the upper triangular part of the matrix with -inf for masked positions'
         """
-        mask = torch.empty(self.extended_context_length, self.extended_context_length)
+        context_length = self.extended_context_length if self.extended_context else self.context_length
+        mask = torch.empty(context_length, context_length)
         mask.fill_(float('-inf'))
         mask.triu_(1)
         return mask
@@ -357,7 +360,7 @@ class CLIP(nn.Module):
         weighted_concepts = torch.matmul(concept_weights,
                                          self.concept_embedding)  # [batch_size, num_concepts] @ [num_concepts, embed_dim] -> [batch_size, embed_dim]
         weighted_concepts = weighted_concepts / (
-                    weighted_concepts.norm(dim=-1, keepdim=True) + 1e-8)  # normalize to ensure they have unit length
+                weighted_concepts.norm(dim=-1, keepdim=True) + 1e-8)  # normalize to ensure they have unit length
         return weighted_concepts.to(self.dtype)
 
     def forward(self, image, text, medical_concepts=None):
@@ -422,7 +425,23 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, load_from_clip: bool = True):
+def build_model(state_dict: dict = None, extended_context: bool = False, load_from_clip = False):
+    if state_dict is None:
+        model = CLIP(
+            embed_dim=CLIP_EMBED_DIM,
+            image_resolution=CLIP_IMAGE_RESOLUTION,
+            vision_layers=CLIP_VISION_LAYERS,
+            vision_width=CLIP_VISION_WIDTH,
+            vision_patch_size=CLIP_PATCH_SIZE,
+            context_length=CLIP_CONTEXT_LENGTH,
+            vocab_size=CLIP_VOCAB_SIZE,
+            transformer_width=CLIP_TRANSFORMER_WIDTH,
+            transformer_heads=CLIP_TRANSFORMER_HEADS,
+            transformer_layers=CLIP_TRANSFORMER_LAYERS,
+            extended_context=extended_context,
+        )
+        return model.train()
+
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -446,7 +465,7 @@ def build_model(state_dict: dict, load_from_clip: bool = True):
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
-        load_from_clip=load_from_clip
+        extended_context=extended_context,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
@@ -460,9 +479,11 @@ def build_model(state_dict: dict, load_from_clip: bool = True):
 
     model_dict.update(pretrained_dict)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys and not load_from_clip:
-        print(f"[Warning] Missing keys in state_dict: {missing_keys}")
-    if unexpected_keys and not load_from_clip:
-        print(f"[Warning] Unexpected keys in state_dict: {unexpected_keys}")
+
+    if not load_from_clip:
+        if missing_keys:
+            print(f"[Warning] Missing keys in state_dict: {missing_keys}")
+        if unexpected_keys:
+            print(f"[Warning] Unexpected keys in state_dict: {unexpected_keys}")
 
     return model.train()

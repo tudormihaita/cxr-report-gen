@@ -36,14 +36,15 @@ class IUXrayDataset(Dataset):
         entry = self.dataset.iloc[idx]
         uid = entry['uid']
 
-        # text = str(entry['impression']) + ' ' + str(entry['findings'])
-        text = str(entry['report'])
+        report_text = str(entry['report'])
+        prompt_text = str(entry['prompt'])
         labels_array = entry[CHEXPERT_LABELS].to_numpy(dtype=np.float32)
         labels = torch.tensor(labels_array, dtype=torch.float).squeeze(0)
 
+        # TODO: load both frontal and lateral projections if present to experiment consistency
         proj_path = entry['frontal_filename'] if pd.notna(entry['frontal_filename']) else entry['lateral_filename']
         image = Image.open(os.path.join(IMAGES_PATH['iu-xray'], proj_path)).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
-        return uid, text, image, labels
+        return uid, report_text, prompt_text, image, labels

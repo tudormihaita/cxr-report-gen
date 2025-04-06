@@ -12,34 +12,72 @@ class CCALoss(nn.Module):
 
     def __init__(
             self,
-            temperature: float = 0.07,
-            concept_weight: float = 0.5,
-            concept_sim_weight: float = 0.3,
+            temperature: float = 0.2,
+            concept_weight: float = 0.2,
+            concept_sim_weight: float = 0.2,
             pos_weight=None,
-            eval=False,
+            soft_align=True,
+            eval_mode=False,
     ):
         super().__init__()
         self.temperature = temperature
         self.concept_weight = concept_weight
         self.concept_sim_weight = concept_sim_weight
         self.pos_weight = pos_weight
+        self.soft_align = soft_align
 
-        if not eval:
-            self.concept_loss_fn = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight)
-        else:
+        if eval_mode:
             self.concept_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
-
-    def clip_loss(self, logits_per_image, logits_pert_text, labels=None, label_sim=None):
-        if label_sim is not None:
-            targets = F.softmax(label_sim / self.temperature, dim=1)
-            log_probs_img = F.log_softmax(logits_per_image, dim=1)
-            log_probs_text = F.log_softmax(logits_pert_text, dim=1)
-            image_loss = F.kl_div(log_probs_img, targets, reduction='batchmean')
-            text_loss = F.kl_div(log_probs_text, targets.T, reduction='batchmean')
         else:
-            image_loss = F.cross_entropy(logits_per_image, labels)
-            text_loss = F.cross_entropy(logits_pert_text, labels)
-        return (image_loss + text_loss) / 2.0
+            self.concept_loss_fn = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight)
+
+    def forward(self, outputs, medical_concepts):
+        clip_loss = self.infonce_loss(
+            outputs['logits_per_image'],
+            outputs['logits_per_text']
+        ) if not self.soft_align else self.soft_contrastive_loss(
+            outputs['logits_per_image'],
+            outputs['logits_per_text'],
+            medical_concepts
+        )
+
+        loss_dict = {
+            "infonce_loss": clip_loss.item(),
+        }
+        total_loss = clip_loss
+
+        if self.concept_weight > 0:
+            concept_loss = self.concept_classification_loss(outputs['concepts_logits'], medical_concepts)
+            total_loss += concept_loss * self.concept_weight
+            loss_dict["concept_loss"] = concept_loss.item()
+
+        if self.concept_sim_weight > 0 and "concepts_image_similarity" in outputs:
+            concept_sim_loss = self.concept_similarity_loss(outputs['concepts_image_similarity'], medical_concepts)
+            total_loss += self.concept_sim_weight * concept_sim_loss
+            loss_dict["concepts_sim_loss"] = concept_sim_loss.item()
+
+        loss_dict["total_loss"] = total_loss.item()
+        return total_loss, loss_dict
+
+    def infonce_loss(self, logits_per_image, logits_per_text):
+        # constructing similarity matrix for image-text pairs
+        batch_size = logits_per_image.shape[0]
+        labels = torch.arange(batch_size, device=logits_per_image.device)
+
+        loss_i2t = F.cross_entropy(logits_per_image, labels)
+        loss_t2i = F.cross_entropy(logits_per_text, labels)
+        return (loss_i2t + loss_t2i) / 2.0
+
+    def soft_contrastive_loss(self, logits_per_image, logits_per_text, medical_concepts):
+        soft_targets = calculate_concept_similarity(medical_concepts, medical_concepts)
+
+        targets = F.softmax(soft_targets / self.temperature, dim=1)
+        log_probs_img = F.log_softmax(logits_per_image, dim=1)
+        log_probs_text = F.log_softmax(logits_per_text, dim=1)
+
+        loss_i2t = F.kl_div(log_probs_img, targets, reduction='batchmean')
+        loss_t2i = F.kl_div(log_probs_text, targets, reduction='batchmean')
+        return (loss_i2t + loss_t2i) / 2.0
 
     def concept_classification_loss(self, concepts_logits, medical_concepts):
         # masking uncertain labels to ensure loss calculation only on certain labels
@@ -76,42 +114,6 @@ class CCALoss(nn.Module):
 
         loss = F.kl_div(log_probs, targets, reduction='batchmean')
         return loss
-
-    def forward(self, outputs, medical_concepts):
-        batch_size = outputs['logits_per_image'].shape[0]
-        similarity_matrix_labels = torch.arange(batch_size, device=outputs['logits_per_image'].device)
-
-        clip_loss = self.clip_loss(
-            outputs['logits_per_image'],
-            outputs['logits_per_text'],
-            similarity_matrix_labels
-        )
-
-        loss_dict = {
-            "clip_loss": clip_loss.item(),
-        }
-        total_loss = clip_loss
-
-        if self.concept_weight > 0:
-            concept_loss = self.concept_classification_loss(
-                outputs['concepts_logits'],
-                medical_concepts
-            )
-            total_loss += concept_loss * self.concept_weight
-            loss_dict["concept_loss"] = concept_loss.item()
-
-        if self.concept_sim_weight > 0:
-            if "concepts_image_similarity" in outputs:
-                concept_sim_loss = self.concept_similarity_loss(
-                    outputs['concepts_image_similarity'],
-                    medical_concepts
-                )
-                total_loss += self.concept_sim_weight * concept_sim_loss
-                loss_dict["concepts_sim_loss"] = concept_sim_loss.item()
-
-        loss_dict["total_loss"] = total_loss.item()
-        return total_loss, loss_dict
-
 
 def calculate_concept_similarity(concepts1, concepts2):
     batch_size = concepts1.shape[0]

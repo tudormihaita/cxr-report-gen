@@ -100,22 +100,24 @@ def tokenize(texts: Union[str, List[str]], context_length: int = CLIP_CONTEXT_LE
 
 
 def load(
-        name: str,
+        name: str = None,
         device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
         jit: bool = False,
         download_root: str = None,
-        load_from_clip: bool = True,
+        load_from_clip: bool = False,
         load_checkpoint: bool = False,
+        extended_context: bool = False,
 ):
     """
     Loads a pretrained CLIP model with the chosen architecture.
 
-    :param name: a model name listed by 'available_models()' or the path to a model checkpoint containing the state_dict
+    :param name: a model name listed by 'available_models()' or the path to a model checkpoint containing the state_dict. Can be None if training from scratch.
     :param device: device to load the model onto
     :param jit: whether to load the optimized JIT model or the original state_dict
     :param download_root: path to download the model files; defaults to ~/.cache/clip
     :param load_from_clip: load a pre-trained model from the official OpenAI repository
     :param load_checkpoint: load a checkpoint from the local file system, with extended context length and other pretrained weights
+    :param extended_context: whether to extend the positional embeddings to support longer text sequences
     """
 
     def _download(url: str, root: str):
@@ -182,6 +184,13 @@ def load(
 
         return positional_embedding_res
 
+    if sum([load_from_clip, load_checkpoint]) != 1:
+        raise RuntimeError("Please specify exactly one of `load_from_clip` or `load_checkpoint` to load a model")
+
+    if name is None:
+        model = build_model(state_dict=None, load_from_clip=False).to(device)
+        return model, _transform(model.visual.input_resolution)
+
     if load_from_clip:
         if name in _MODELS:
             model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
@@ -207,9 +216,9 @@ def load(
                 state_dict = torch.load(model_path, map_location="cpu")
 
     if not jit:
-        model = build_model(state_dict or model.state_dict(), load_from_clip).to(device)
+        model = build_model(state_dict or model.state_dict(), extended_context, load_from_clip).to(device)
 
-        if load_from_clip:
+        if extended_context:
             positional_embedding_pre = model.positional_embedding.type(model.dtype)
             positional_embedding_resized = _extend_positional_embeddings(positional_embedding_pre, keep_len=20)
 

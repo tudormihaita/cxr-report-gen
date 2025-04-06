@@ -43,19 +43,20 @@ class CxrDataLoader(DataLoader):
         if len(data) == 0:
             return None
 
-        uid_batch, text_batch, image_batch, label_batch = zip(*data)
+        uid_batch, report_batch, prompt_batch, image_batch, label_batch = zip(*data)
 
         image_batch = torch.stack(image_batch, 0)
         label_batch = torch.stack(label_batch, 0)
 
-        # padding mask used in conditional generation input to prevent attending to padded text tokens
         # TODO: move mask computation and tokenization outside batch
+        # padding mask used in conditional generation input to prevent attending to padded text tokens
         # mask_batch = (tokenized_texts_batch != 0).long()
 
         return {
             'uid': uid_batch,
             'image': image_batch,
-            'report': text_batch,
+            'report': report_batch,
+            'prompt': prompt_batch,
             'labels': label_batch
         }
 

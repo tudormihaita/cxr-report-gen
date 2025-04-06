@@ -2,8 +2,10 @@ import os
 import time
 import json
 import torch
-import numpy as np
 import logging
+import numpy as np
+import pandas as pd
+
 from tqdm import tqdm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -92,17 +94,17 @@ class CLIPTrainer:
         ) if weighted_loss else None
 
         self.loss_fn = CCALoss(
-            temperature=0.07,
-            concept_weight=0.5 if multi_task else 0.0,
-            concept_sim_weight=0.3 if multi_task else 0.0,
+            temperature=0.2,
+            concept_weight=0.2 if multi_task else 0.0,
+            concept_sim_weight=0.2 if multi_task else 0.0,
             pos_weight=self.pos_weights,
         )
         self.eval_loss_fn = CCALoss(
-            temperature=0.07,
-            concept_weight=0.5 if multi_task else 0.0,
-            concept_sim_weight=0.3 if multi_task else 0.0,
+            temperature=0.2,
+            concept_weight=0.2 if multi_task else 0.0,
+            concept_sim_weight=0.2 if multi_task else 0.0,
             pos_weight=None,
-            eval=True
+            eval_mode=True
         )
 
         concept_params = [p for n, p in model.named_parameters() if
@@ -226,7 +228,7 @@ class CLIPTrainer:
 
     def train_step(self, batch):
         images = batch['image'].to(self.device)
-        text_tokens = self.tokenizer.encode(batch['report'], truncate=True).to(self.device)
+        text_tokens = self.tokenizer.encode(batch['prompt'], truncate=True, extended_context=self.model.extended_context).to(self.device)
         medical_concepts = batch['labels'].to(self.device)
 
         # batch attention mask not used in this context for pretraining CLIP, due to using pre-computed causal mask
@@ -293,7 +295,7 @@ class CLIPTrainer:
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
             images = batch['image'].to(self.device)
-            text_tokens = self.tokenizer.encode(batch['report'], truncate=True).to(self.device)
+            text_tokens = self.tokenizer.encode(batch['prompt'], truncate=True).to(self.device)
             medical_concepts = batch['labels'].to(self.device)
 
             outputs = self.model(images, text_tokens, medical_concepts)
@@ -396,6 +398,24 @@ class CLIPTrainer:
 
             # calculate retrieval metrics: not relevant for now
             metrics.update(self._calculate_retrieval_metrics(similarity, phase))
+
+            embedding_data = []
+            for i in range(img_embeds.shape[0]):
+                embedding_data.append({
+                    "uid": f"img_{i}",
+                    "type": "image",
+                    "embedding": img_embeds[i].cpu().numpy()
+                })
+
+            for i in range(text_embeds.shape[0]):
+                embedding_data.append({
+                    "uid": f"text_{i}",
+                    "type": "text",
+                    "embedding": text_embeds[i].cpu().numpy()
+                })
+
+            emb_df = pd.DataFrame(embedding_data)
+            emb_df.to_pickle(os.path.join(self.output_dir, f"{phase}_embeddings.pkl"))
 
         # log metrics
         self.logger.info(
