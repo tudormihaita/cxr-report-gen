@@ -14,6 +14,7 @@ from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normal
 
 from .model import build_model
 from .tokenizer import BpeTokenizer as _Tokenizer
+from constants import CLIP_CONTEXT_LENGTH, CLIP_EXTENDED_CONTEXT_LENGTH
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -61,7 +62,7 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False, extended_context: bool = True) -> torch.Tensor:
+def tokenize(texts: Union[str, List[str]], context_length: int = CLIP_CONTEXT_LENGTH, truncate: bool = False, extended_context: bool = True) -> torch.Tensor:
     """
     Returns the tokenized representation of given input string(s).
 
@@ -72,7 +73,7 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
     :return: two-dimensional tensor containing the resulting tokens with the shape = [number of input strings, context_length]
     """
     if extended_context:
-        context_length = 248
+        context_length = CLIP_EXTENDED_CONTEXT_LENGTH
 
     if isinstance(texts, str):
         texts = [texts]
@@ -103,7 +104,8 @@ def load(
         device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
         jit: bool = False,
         download_root: str = None,
-        load_from_clip: bool = True
+        load_from_clip: bool = True,
+        load_checkpoint: bool = False,
 ):
     """
     Loads a pretrained CLIP model with the chosen architecture.
@@ -113,6 +115,7 @@ def load(
     :param jit: whether to load the optimized JIT model or the original state_dict
     :param download_root: path to download the model files; defaults to ~/.cache/clip
     :param load_from_clip: load a pre-trained model from the official OpenAI repository
+    :param load_checkpoint: load a checkpoint from the local file system, with extended context length and other pretrained weights
     """
 
     def _download(url: str, root: str):
@@ -197,7 +200,11 @@ def load(
             if jit:
                 warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
                 jit = False
-            state_dict = torch.load(model_path, map_location="cpu")
+            if load_checkpoint:
+                checkpoint = torch.load(model_path, map_location="cpu")
+                state_dict = checkpoint.get("model_state_dict", checkpoint)
+            else:
+                state_dict = torch.load(model_path, map_location="cpu")
 
     if not jit:
         model = build_model(state_dict or model.state_dict(), load_from_clip).to(device)

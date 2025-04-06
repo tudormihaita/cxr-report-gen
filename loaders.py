@@ -1,11 +1,10 @@
 import torch
 
-from clip import tokenize
 from torch.utils.data import DataLoader
 from datasets import IUXrayDataset
 
 class CxrDataLoader(DataLoader):
-    def __init__(self, args, split, transform=None):
+    def __init__(self, args, split, transform=None, sampler=None):
         self.args = args
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
@@ -13,6 +12,7 @@ class CxrDataLoader(DataLoader):
         self.max_seq_length = args.max_seq_length
 
         self.split = split
+        self.sampler = sampler
         self.transform = transform
 
         if self.dataset_name == 'iu-xray':
@@ -24,10 +24,17 @@ class CxrDataLoader(DataLoader):
         self.init_kwargs = {
             'dataset': self.dataset,
             'batch_size': self.batch_size,
-            'shuffle': True if self.split == 'train' else False,
             'collate_fn': self.collate_fn,
-            'num_workers': self.num_workers
+            'num_workers': self.num_workers,
         }
+
+        if self.sampler is not None:
+            self.init_kwargs['sampler'] = self.sampler
+            self.init_kwargs['shuffle'] = False
+            self.init_kwargs['batch_size'] = self.batch_size
+        else:
+            self.init_kwargs['shuffle'] = (self.split == 'train')
+
         super().__init__(**self.init_kwargs)
 
     @staticmethod
@@ -39,15 +46,16 @@ class CxrDataLoader(DataLoader):
         uid_batch, text_batch, image_batch, label_batch = zip(*data)
 
         image_batch = torch.stack(image_batch, 0)
-        tokenized_texts_batch = tokenize(list(text_batch), truncate=True)
-        mask_batch = (tokenized_texts_batch != 0).long()
         label_batch = torch.stack(label_batch, 0)
+
+        # padding mask used in conditional generation input to prevent attending to padded text tokens
+        # TODO: move mask computation and tokenization outside batch
+        # mask_batch = (tokenized_texts_batch != 0).long()
 
         return {
             'uid': uid_batch,
-            'text_tokens': tokenized_texts_batch,
             'image': image_batch,
-            'attn_mask': mask_batch,
+            'report': text_batch,
             'labels': label_batch
         }
 

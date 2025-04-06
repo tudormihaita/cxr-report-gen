@@ -7,10 +7,11 @@ import logging
 from tqdm import tqdm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 
 from clip.loss import CCALoss
+from clip.tokenizer import CLIPTokenizer
 
 
 class CLIPTrainer:
@@ -26,6 +27,7 @@ class CLIPTrainer:
             val_loader=None,
             test_loader=None,
             device='cuda' if torch.cuda.is_available() else 'cpu',
+            threshold=0.7,
             learning_rate=1e-5,
             weight_decay=0.01,
             warmup_steps=1000,
@@ -35,8 +37,8 @@ class CLIPTrainer:
             save_interval=1000,
             gradient_accumulation_steps=1,
             mixed_precision=True,
-            freeze_vision_encoder=False,
-            freeze_text_encoder=False,
+            weighted_loss=False,
+            multi_task=True,
             max_grad_norm=1.0
     ):
         """
@@ -56,15 +58,17 @@ class CLIPTrainer:
         :param save_interval: how often to save model checkpoints
         :param gradient_accumulation_steps: number of steps to accumulate gradients
         :param mixed_precision: whether to use mixed precision training
-        :param freeze_vision_encoder: whether to freeze the vision encoder weights
-        :param freeze_text_encoder: whether to freeze the text encoder weights
         :param max_grad_norm: maximum gradient norm for gradient clipping
         """
         self.model = model
+        self.tokenizer = CLIPTokenizer()
+
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
+
         self.device = device
+        self.threshold = threshold
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
@@ -75,64 +79,48 @@ class CLIPTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.mixed_precision = mixed_precision
         self.max_grad_norm = max_grad_norm
+        self.multi_task = multi_task
 
         os.makedirs(output_dir, exist_ok=True)
 
-        logging.basicConfig(
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%m/%d/%Y %H:%M:%S',
-            level=logging.INFO,
-            handlers=[
-                logging.FileHandler(os.path.join(output_dir, 'training.log')),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        self.logger = self.__setup_logger(__name__)
+
+        self.pos_weights = self.__compute_pos_weights(
+            dataloader=self.train_loader,
+            num_classes=self.model.num_classes,
+            device=self.device
+        ) if weighted_loss else None
 
         self.loss_fn = CCALoss(
             temperature=0.07,
-            concept_weight=0.5,
-            concept_sim_weight=0.3
+            concept_weight=0.5 if multi_task else 0.0,
+            concept_sim_weight=0.3 if multi_task else 0.0,
+            pos_weight=self.pos_weights,
+        )
+        self.eval_loss_fn = CCALoss(
+            temperature=0.07,
+            concept_weight=0.5 if multi_task else 0.0,
+            concept_sim_weight=0.3 if multi_task else 0.0,
+            pos_weight=None,
+            eval=True
         )
 
-        # TODO: set up optimizer with parameter groups
-        param_groups = []
+        concept_params = [p for n, p in model.named_parameters() if
+                          ("medical_concept" in n or "concept_embedding" in n) and p.requires_grad]
+        clip_params = [p for n, p in model.named_parameters() if
+                       not ("medical_concept" in n or "concept_embedding" in n) and p.requires_grad]
 
-        # vision encoder parameters
-        if not freeze_vision_encoder:
-            vision_params = [p for n, p in model.named_parameters()
-                             if "visual" in n and p.requires_grad]
-            param_groups.append({"params": vision_params, "lr": learning_rate})
-        else:
-            for n, p in model.named_parameters():
-                if "visual" in n:
-                    p.requires_grad = False
-
-        # text encoder parameters
-        if not freeze_text_encoder:
-            text_params = [p for n, p in model.named_parameters()
-                           if ("transformer" in n or "token_embedding" in n or
-                               "positional_embedding" in n or "ln_final" in n or
-                               "text_projection" in n) and p.requires_grad]
-            param_groups.append({"params": text_params, "lr": learning_rate})
-        else:
-            for n, p in model.named_parameters():
-                if ("transformer" in n or "token_embedding" in n or
-                        "positional_embedding" in n or "ln_final" in n or
-                        "text_projection" in n):
-                    p.requires_grad = False
-
-        # medical concept related parameters (always trainable)
-        concept_params = [p for n, p in model.named_parameters()
-                          if ("medical_concept" in n or "concept_embedding" in n) and p.requires_grad]
-        param_groups.append({"params": concept_params, "lr": learning_rate * 5})  # higher LR for new parameters
+        param_groups = [
+            {"params": concept_params, "lr": learning_rate * 0.5},
+            {"params": clip_params, "lr": learning_rate}
+        ]
 
         # set up optimizer and scheduler
-        self.optimizer = AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        self.optimizer = AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_steps)
 
         # set up gradient scaler for mixed precision training
-        self.scaler = GradScaler() if mixed_precision and device == 'cuda' else None
+        self.scaler = GradScaler('cuda') if mixed_precision and device == 'cuda' else None
 
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -146,11 +134,45 @@ class CLIPTrainer:
         self.logger.info(f"Total parameters: {total_params:,}")
         self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%})")
 
+    @staticmethod
+    def __setup_logger(name):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        logger.propagate = False
+
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        return logger
+
+    @staticmethod
+    def __compute_pos_weights(dataloader, num_classes, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        total_pos = torch.zeros(num_classes, dtype=torch.float32).to(device)
+        total_neg = torch.zeros(num_classes, dtype=torch.float32).to(device)
+        total_samples = 0
+
+        for batch in tqdm(dataloader, desc="Computing pos weights"):
+            labels = batch['labels'].to(device)
+            mask = labels != -1
+
+            pos = (labels == 1) & mask
+            neg = (labels == 0) & mask
+
+            total_pos += pos.sum(dim=0).float()
+            total_neg += neg.sum(dim=0).float()
+            total_samples += labels.size(0)
+
+        pos_weights = total_neg / (total_pos + 1e-8)
+        return pos_weights
+
     def train(self, epochs=None):
         self.logger.info("Starting training")
         self.model.train()
 
-        # step_counter = 0
         if epochs is None:
             steps_per_epoch = len(self.train_loader)
             epochs = (self.max_steps + steps_per_epoch - 1) // steps_per_epoch
@@ -204,13 +226,10 @@ class CLIPTrainer:
 
     def train_step(self, batch):
         images = batch['image'].to(self.device)
-        text_tokens = batch['text_tokens'].to(self.device)
+        text_tokens = self.tokenizer.encode(batch['report'], truncate=True).to(self.device)
         medical_concepts = batch['labels'].to(self.device)
 
-        # get attention mask if available
-        # attention_mask = batch['attn_mask']
-        # if attention_mask is not None:
-        #     attention_mask = attention_mask.to(self.device)
+        # batch attention mask not used in this context for pretraining CLIP, due to using pre-computed causal mask
 
         # zero gradients at the beginning of the accumulation steps
         if self.global_step % self.gradient_accumulation_steps == 0:
@@ -218,7 +237,7 @@ class CLIPTrainer:
 
         # forward pass with mixed precision if enabled
         if self.mixed_precision and self.device == 'cuda':
-            with autocast():
+            with autocast('cuda'):
                 outputs = self.model(images, text_tokens, medical_concepts)
 
                 loss, loss_dict = self.loss_fn(outputs, medical_concepts)
@@ -231,7 +250,7 @@ class CLIPTrainer:
 
             # update weights if we've accumulated enough gradients
             if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-                if self.max_grad_norm > 0:
+                if self.mixed_precision and self.max_grad_norm > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
@@ -267,29 +286,19 @@ class CLIPTrainer:
         phase = "test" if test else "val"
 
         total_loss = 0.0
-        all_concepts_pred = []
-        all_concepts_true = []
-        all_img_embeds = []
-        all_text_embeds = []
-        all_concept_embeds = []
+        all_img_embeds, all_text_embeds, all_concept_embeds = [], [], []
+        all_concepts_pred , all_concepts_gt = [], []
 
         self.logger.info(f"Running evaluation on {phase} set")
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
-            if batch is None:
-                continue
-
             images = batch['image'].to(self.device)
-            text_tokens = batch['text_tokens'].to(self.device)
+            text_tokens = self.tokenizer.encode(batch['report'], truncate=True).to(self.device)
             medical_concepts = batch['labels'].to(self.device)
-
-            # attention_mask = batch['attn_mask']
-            # if attention_mask is not None:
-            #     attention_mask = attention_mask.to(self.device)
 
             outputs = self.model(images, text_tokens, medical_concepts)
 
-            loss, loss_dict = self.loss_fn(outputs, medical_concepts)
+            loss, loss_dict = self.eval_loss_fn(outputs, medical_concepts)
 
             # store predictions and ground truth
             total_loss += loss_dict["total_loss"]
@@ -305,64 +314,72 @@ class CLIPTrainer:
             all_concepts_pred.append(concepts_pred)
 
             # convert uncertain (-1) to masked values for metrics calculation
-            concepts_true = medical_concepts.clone().cpu().numpy()
-            mask = (concepts_true != -1)
-            concepts_true[concepts_true == -1] = 0  # replace uncertain with 0 for metrics
-            all_concepts_true.append((concepts_true, mask))
+            concepts_gt = medical_concepts.clone().cpu().numpy()
+            concepts_gt[concepts_gt == -1] = 0  # replace uncertain with 0 for relevant metrics
+            mask = (concepts_gt != -1)
+            all_concepts_gt.append((concepts_gt, mask))
 
         # calculate average loss
         avg_loss = total_loss / len(dataloader)
-
-        # concatenate predictions and ground truth
-        all_concepts_pred = np.concatenate(all_concepts_pred, axis=0)
-
-        # calculate metrics only on non-uncertain labels
         metrics = {f"{phase}_loss": avg_loss}
 
-        # calculate AUC and other metrics for concept prediction
-        if len(all_concepts_true) > 0:
-            # combine all masks and ground truth
-            all_gt = np.concatenate([gt for gt, _ in all_concepts_true], axis=0)
-            all_masks = np.concatenate([mask for _, mask in all_concepts_true], axis=0)
+        if self.multi_task:
+            # concatenate predictions and ground truth
+            all_concepts_pred = np.concatenate(all_concepts_pred, axis=0)
 
-            # calculate AUC per concept
-            aucs = []
-            precision_list = []
-            recall_list = []
-            f1_list = []
+            # calculate AUC for concept classification
+            if len(all_concepts_gt) > 0:
+                # combine all masks and ground truth
+                all_gt = np.concatenate([gt for gt, _ in all_concepts_gt], axis=0)
+                all_masks = np.concatenate([mask for _, mask in all_concepts_gt], axis=0)
 
-            # get per-concept metrics
-            for i in range(self.model.num_medical_concepts):
-                concept_mask = all_masks[:, i]
-                if concept_mask.sum() > 0:  # only calculate if we have non-masked values
-                    # AUC
-                    try:
-                        auc = roc_auc_score(all_gt[concept_mask, i], all_concepts_pred[concept_mask, i])
-                        aucs.append(auc)
-                    except ValueError:
-                        # this can happen if there's only one class in the ground truth
-                        pass
+                # calculate AUC per concept
+                aucs = []
+                for i in range(self.model.num_classes):
+                    concept_mask = all_masks[:, i]
+                    if concept_mask.sum() > 0:  # only calculate if we have non-masked values
+                        try:
+                            auc = roc_auc_score(all_gt[concept_mask, i], all_concepts_pred[concept_mask, i])
+                            aucs.append(auc)
+                        except ValueError:
+                            self.logger.warning(f"Concept mask {i} is empty, AUC failed to compute.")
+                            continue
 
-                    # precision, recall, F1 at threshold 0.5
-                    pred_binary = (all_concepts_pred[concept_mask, i] > 0.5).astype(int)
-                    precision, recall, f1, _ = precision_recall_fscore_support(
-                        all_gt[concept_mask, i],
-                        pred_binary,
-                        average='binary'
-                    )
-                    precision_list.append(precision)
-                    recall_list.append(recall)
-                    f1_list.append(f1)
 
-            # add metrics to the result dict
-            if aucs:
-                metrics[f"{phase}_concept_auc_avg"] = np.mean(aucs)
-            if precision_list:
-                metrics[f"{phase}_concept_precision_avg"] = np.mean(precision_list)
-            if recall_list:
-                metrics[f"{phase}_concept_recall_avg"] = np.mean(recall_list)
-            if f1_list:
-                metrics[f"{phase}_concept_f1_avg"] = np.mean(f1_list)
+                # calculate precision, recall, and F1 score
+                thresholds = [0.4, 0.5, 0.7]
+                best_classification_metrics = {}
+                best_f1 = 0.0
+
+                for t in thresholds:
+                    f1s, precisions, recalls = [], [], []
+                    for i in range(self.model.num_classes):
+                        concept_mask = all_masks[:, i]
+                        if concept_mask.sum() > 0:
+                            pred_labels = (all_concepts_pred[concept_mask, i] > t).astype(int)
+                            precision, recall, f1, _ = precision_recall_fscore_support(
+                                all_gt[concept_mask, i],
+                                pred_labels,
+                                average='binary',
+                                zero_division=0
+                            )
+                            precisions.append(precision)
+                            recalls.append(recall)
+                            f1s.append(f1)
+
+                    mean_f1 = np.mean(f1s)
+                    if mean_f1 > best_f1:
+                        best_f1 = mean_f1
+                        best_classification_metrics = {
+                            f"{phase}_best_threshold": t,
+                            f"{phase}_mean_f1": mean_f1,
+                            f"{phase}_mean_precision": np.mean(precisions),
+                            f"{phase}_mean_recall": np.mean(recalls)
+                        }
+
+                metrics.update(best_classification_metrics)
+                if aucs:
+                    metrics[f"{phase}_concept_auc_avg"] = np.mean(aucs)
 
         # calculate retrieval metrics
         if len(all_img_embeds) > 0 and len(all_text_embeds) > 0:
@@ -377,19 +394,18 @@ class CLIPTrainer:
             # calculate similarity scores
             similarity = (img_embeds @ text_embeds.T).numpy()
 
-            # calculate retrieval metrics
+            # calculate retrieval metrics: not relevant for now
             metrics.update(self._calculate_retrieval_metrics(similarity, phase))
 
         # log metrics
         self.logger.info(
             f"{phase.capitalize()} metrics: {json.dumps({k: float(v) for k, v in metrics.items()}, indent=2)}")
 
-        # set model back to training mode
         self.model.train()
-
         return metrics
 
-    def _calculate_retrieval_metrics(self, similarity, phase):
+    @staticmethod
+    def _calculate_retrieval_metrics(similarity, phase):
         """Calculate retrieval metrics (recall@k) from similarity matrix."""
         metrics = {}
         batch_size = similarity.shape[0]

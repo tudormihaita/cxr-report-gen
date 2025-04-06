@@ -2,9 +2,13 @@ import os
 import gzip
 import html
 import ftfy
+import torch
 import regex as re
 
+from packaging import version
+from typing import Union, List
 from functools import lru_cache
+from constants import CLIP_CONTEXT_LENGTH, CLIP_EXTENDED_CONTEXT_LENGTH
 
 
 @lru_cache()
@@ -135,3 +139,34 @@ class BpeTokenizer(object):
         text = ''.join([self.decoder[token] for token in tokens])
         text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors='replace').replace('</w>', ' ')
         return text
+
+class CLIPTokenizer(object):
+    def __init__(self):
+        self.bpe = BpeTokenizer()
+        self.sot_token = self.bpe.encoder['<|startoftext|>']
+        self.eot_token = self.bpe.encoder['<|endoftext|>']
+
+    def encode(self, texts: Union[str, List[str]], context_length: int = CLIP_CONTEXT_LENGTH, truncate: bool = True, extended_context: bool = True):
+        if extended_context:
+            context_length = CLIP_EXTENDED_CONTEXT_LENGTH
+
+        if isinstance(texts, str):
+            texts = [texts]
+
+        all_tokens = [[self.sot_token] + self.bpe.encode(text) + [self.eot_token] for text in texts]
+
+        if version.parse(torch.__version__) < version.parse("1.8.0"):
+            tokenized = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+        else:
+            tokenized = torch.zeros(len(all_tokens), context_length, dtype=torch.int)
+
+        for i, tokens in enumerate(all_tokens):
+            if len(tokens) > context_length:
+                if truncate:
+                    tokens = tokens[:context_length]
+                    tokens[-1] = self.eot_token
+                else:
+                    raise RuntimeError(f"Input {texts[i]} is too long for context length {context_length}")
+            tokenized[i, :len(tokens)] = torch.tensor(tokens)
+
+        return tokenized

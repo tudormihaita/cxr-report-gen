@@ -4,16 +4,29 @@ import pandas as pd
 import numpy as np
 
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 
-ROOT_PATH = '/Volumes/T7 Shield/datasets/iu-xray'
-IMAGES_PATH = os.path.join(ROOT_PATH, 'images/images_normalized')
-LABELS = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion', 'Lung Opacity', 'No Finding', 'Pleural Effusion', 'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices']
+from constants import DATASETS_PATH, IMAGES_PATH, CHEXPERT_LABELS
+
+
+def build_iu_xray_sampler(split, label_columns=CHEXPERT_LABELS):
+    """
+    Create a weighted sampler for the IU-Xray dataset based on the labels.
+    :param split: the split of the dataset (train, val, test)
+    :param label_columns: list of columns containing the labels
+    :return: WeightedRandomSampler
+    """
+    df = pd.read_csv(os.path.join(str(DATASETS_PATH['iu-xray']), 'processed', f'iu_xray_{split}.csv'))
+    labels_array = df[label_columns].replace(-1, 0).values
+    label_freq = np.sum(labels_array, axis=0)
+    inverse_freq = 1.0 / label_freq
+    sample_weights = np.max(labels_array * inverse_freq, axis=1)
+    return WeightedRandomSampler(torch.DoubleTensor(sample_weights), num_samples=len(df), replacement=True)
 
 class IUXrayDataset(Dataset):
     def __init__(self, args, split_path, transform=None):
         self.args = args
-        self.dataset = pd.read_csv(os.path.join(ROOT_PATH, "processed", split_path))
+        self.dataset = pd.read_csv(os.path.join(str(DATASETS_PATH['iu-xray']), 'processed', split_path))
         self.transform = transform
 
     def __len__(self):
@@ -25,13 +38,11 @@ class IUXrayDataset(Dataset):
 
         # text = str(entry['impression']) + ' ' + str(entry['findings'])
         text = str(entry['report'])
-        labels_array = entry[LABELS].to_numpy(dtype=np.float32)
+        labels_array = entry[CHEXPERT_LABELS].to_numpy(dtype=np.float32)
         labels = torch.tensor(labels_array, dtype=torch.float).squeeze(0)
-        labels = torch.where(labels == -1, torch.tensor(0.0), labels)
-
 
         proj_path = entry['frontal_filename'] if pd.notna(entry['frontal_filename']) else entry['lateral_filename']
-        image = Image.open(os.path.join(IMAGES_PATH, proj_path)).convert('RGB')
+        image = Image.open(os.path.join(IMAGES_PATH['iu-xray'], proj_path)).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
