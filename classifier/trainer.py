@@ -10,6 +10,9 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 
+from classifier.loss import FocalBCELoss
+
+
 class ChexpertClassifierTrainer:
     def __init__(
             self,
@@ -18,6 +21,7 @@ class ChexpertClassifierTrainer:
             val_loader,
             test_loader=None,
             device='cuda' if torch.cuda.is_available() else 'cpu',
+            freeze_vision_encoder=False,
             learning_rate=1e-3,
             weight_decay=0.01,
             warmup_steps=1000,
@@ -25,7 +29,8 @@ class ChexpertClassifierTrainer:
             log_interval=100,
             gradient_accumulation_steps=1,
             max_grad_norm=1.0,
-            threshold=0.5
+            threshold=0.5,
+            weighted_loss=False
     ):
         self.model = model
         self.train_loader = train_loader
@@ -41,18 +46,11 @@ class ChexpertClassifierTrainer:
         self.max_grad_norm = max_grad_norm
         self.threshold = threshold
 
-        logging.basicConfig(
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%m/%d/%Y %H:%M:%S',
-            level=logging.INFO,
-            handlers=[
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        # self.logger.propagate = False
+        self.logger = self.__setup_logger(__name__)
 
-        self.loss_fn = nn.BCEWithLogitsLoss()
+        self.pos_weights = self.__compute_pos_weights() if weighted_loss else None
+        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=self.pos_weights)
+        # self.loss_fn = FocalBCELoss()
 
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.max_steps, eta_min=0)
@@ -63,15 +61,47 @@ class ChexpertClassifierTrainer:
 
         self.model = self.model.to(self.device)
 
-        # freezing the vision encoder
-        for param in model.vision_model.parameters():
-            param.requires_grad = False
+        if freeze_vision_encoder:
+            for param in self.model.vision_model.parameters():
+                param.requires_grad = False
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
         self.logger.info(f"Total parameters: {total_params:,}")
         self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%})")
+
+    @staticmethod
+    def __setup_logger(name):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        logger.propagate = False
+
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        return logger
+
+    def __compute_pos_weights(self):
+        pos_count = torch.zeros(self.model.num_classes, dtype=torch.float)
+        neg_count = torch.zeros(self.model.num_classes, dtype=torch.float)
+
+        for batch in tqdm(self.train_loader, desc="Computing class counts"):
+            labels = batch['labels']
+            labels = labels.to(torch.float)
+
+            labels = torch.where(labels == -1, torch.tensor(1.0), labels)
+
+            pos_count += labels.sum(dim=0)
+            neg_count += (1.0 - labels).sum(dim=0)
+
+        pos_weights = neg_count / (pos_count + 1e-6)
+        pos_weights = pos_weights.to(self.device)
+        return pos_weights
 
     def train(self, epochs=None):
         self.logger.info("Start training")
@@ -112,15 +142,15 @@ class ChexpertClassifierTrainer:
         self.logger.info("Training finished")
 
     def train_step(self, batch):
-        inputs, labels = batch['image'], batch['labels']
+        inputs, labels = batch['image'].to(self.device), batch['labels'].to(self.device)
 
         if self.global_step % self.gradient_accumulation_steps == 0:
             self.optimizer.zero_grad()
 
         outputs = self.model(inputs)
 
-        probs = outputs['probs']
-        loss = self.loss_fn(probs, labels)
+        logits = outputs['logits']
+        loss = self.loss_fn(logits, labels)
         original_loss = loss
 
         loss = loss / self.gradient_accumulation_steps
@@ -135,7 +165,6 @@ class ChexpertClassifierTrainer:
 
         return original_loss
 
-
     @torch.no_grad()
     def evaluate(self, test=False):
         self.model.eval()
@@ -148,22 +177,19 @@ class ChexpertClassifierTrainer:
         self.logger.info(f"Running evaluation on {phase} set")
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
-            if batch is None:
-                continue
+            embeds, labels = batch['image'].to(self.device), batch['labels'].to(self.device)
 
-            embeds, labels = batch['image'], batch['labels']
             outputs = self.model(embeds)
-            probs = outputs['probs']
+            logits = outputs['logits']
+            loss = self.loss_fn(logits, labels)
+            total_loss += loss.item()
 
-            loss = self.loss_fn(probs, labels)
-            total_loss += loss
-
-            labels_pred = outputs['probs'].detach().cpu().numpy()
+            labels_pred = torch.sigmoid(logits).cpu().numpy()
             all_labels_pred.append(labels_pred)
 
             labels_gt = labels.clone().detach().cpu().numpy()
-            mask = labels_gt != -1
-            labels_gt[labels_gt == -1] = 0
+            labels_gt[labels_gt == -1] = 0.0
+            mask = (labels_gt != -1)
             all_labels_gt.append((labels_gt, mask))
 
         avg_loss = total_loss / len(dataloader)
@@ -173,15 +199,14 @@ class ChexpertClassifierTrainer:
             f"{phase}_loss": avg_loss
         }
 
+        uncertain_cases = ((all_labels_pred >= 0.45) & (all_labels_pred <= 0.55)).sum()
+        self.logger.info(f"Number of uncertain cases predicted near 0.5: {uncertain_cases}")
+
         if len(all_labels_gt) > 0:
             all_gt = np.concatenate([gt for gt, _ in all_labels_gt], axis=0)
             all_masks = np.concatenate([mask for _, mask in all_labels_gt], axis=0)
 
             aucs = []
-            precisions = []
-            recalls = []
-            f1s = []
-
             for i in range(self.model.num_classes):
                 concept_mask = all_masks[:, i]
                 if concept_mask.sum() > 0:
@@ -190,29 +215,46 @@ class ChexpertClassifierTrainer:
                         aucs.append(auc)
                     except ValueError:
                         self.logger.warning(f"AUC calculation failed for concept {i}")
-                        pass
+                        continue
 
-                    pred_labels = (all_labels_pred[concept_mask, i] > self.threshold).astype(int)
-                    precision, recall, f1, _ = precision_recall_fscore_support(
-                        all_gt[concept_mask, i],
-                        pred_labels,
-                        average='binary',
-                        zero_division=0
-                    )
-                    precisions.append(precision)
-                    recalls.append(recall)
-                    f1s.append(f1)
+            test_thresholds = [0.4, 0.5, 0.7]
+            best_metrics = {}
+            best_f1 = 0.0
 
+            for t in test_thresholds:
+                f1s, precisions, recalls = [], [], []
+                for i in range(self.model.num_classes):
+                    concept_mask = all_masks[:, i]
+                    if concept_mask.sum() > 0:
+                        pred_labels = (all_labels_pred[concept_mask, i] > t).astype(int)
+                        precision, recall, f1, _ = precision_recall_fscore_support(
+                            all_gt[concept_mask, i],
+                            pred_labels,
+                            average='binary',
+                            zero_division=0
+                        )
+                        precisions.append(precision)
+                        recalls.append(recall)
+                        f1s.append(f1)
+
+                        # print(pred_labels[:5])
+
+                mean_f1 = np.mean(f1s)
+                if mean_f1 > best_f1:
+                    best_f1 = mean_f1
+                    best_metrics = {
+                        f"{phase}_best_threshold": t,
+                        f"{phase}_mean_f1": mean_f1,
+                        f"{phase}_mean_precision": np.mean(precisions),
+                        f"{phase}_mean_recall": np.mean(recalls)
+                    }
+
+            metrics.update(best_metrics)
             if aucs:
                 metrics[f"{phase}_auc"] = np.mean(aucs)
-            if precisions:
-                metrics[f"{phase}_precision"] = np.mean(precisions)
-            if recalls:
-                metrics[f"{phase}_recall"] = np.mean(recalls)
-            if f1s:
-                metrics[f"{phase}_f1"] = np.mean(f1s)
 
-        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps({k: float(v) for k, v in metrics.items()}, indent=2)}")
+        self.logger.info(
+            f"{phase.capitalize()} metrics: {json.dumps({k: v if isinstance(v, list) else float(v) for k, v in metrics.items()}, indent=2)}")
 
         self.model.train()
         return metrics
