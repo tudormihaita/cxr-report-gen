@@ -42,7 +42,7 @@ class CCALoss(nn.Module):
         )
 
         loss_dict = {
-            "infonce_loss": clip_loss.item(),
+            "clip_loss": clip_loss.item(),
         }
         total_loss = clip_loss
 
@@ -114,6 +114,27 @@ class CCALoss(nn.Module):
 
         loss = F.kl_div(log_probs, targets, reduction='batchmean')
         return loss
+
+class ImageTextContrastiveLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, outputs):
+        logits_per_image, logits_per_text = outputs['logits_per_image'], outputs['logits_per_text']
+        batch_size = logits_per_image.shape[0]
+        device = logits_per_image.device
+        labels = torch.arange(batch_size, device=device)
+
+        i2t_loss = self.criterion(logits_per_image, labels)
+        t2i_loss = self.criterion(logits_per_text, labels)
+        infonce_loss = (i2t_loss + t2i_loss) / 2.0
+
+        loss_dict = {
+            "clip_loss": infonce_loss.item(),
+        }
+        return infonce_loss, loss_dict
+
 
 def calculate_concept_similarity(concepts1, concepts2):
     batch_size = concepts1.shape[0]

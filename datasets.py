@@ -36,7 +36,7 @@ class IUXrayDataset(Dataset):
         entry = self.dataset.iloc[idx]
         uid = entry['uid']
 
-        report_text = str(entry['report'])
+        report_text = str(entry['impression'])
         prompt_text = str(entry['prompt'])
         labels_array = entry[CHEXPERT_LABELS].to_numpy(dtype=np.float32)
         labels = torch.tensor(labels_array, dtype=torch.float).squeeze(0)
