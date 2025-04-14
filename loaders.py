@@ -1,7 +1,8 @@
 import torch
 
 from torch.utils.data import DataLoader
-from datasets import IUXrayDataset
+from datasets import IUXrayDataset, MimicCXRDataset
+
 
 class CxrDataLoader(DataLoader):
     def __init__(self, args, split, transform=None, sampler=None):
@@ -10,6 +11,7 @@ class CxrDataLoader(DataLoader):
         self.num_workers = args.num_workers
         self.dataset_name = args.dataset_name
         self.max_seq_length = args.max_seq_length
+        self.use_minio = args.use_minio
 
         self.split = split
         self.sampler = sampler
@@ -18,6 +20,9 @@ class CxrDataLoader(DataLoader):
         if self.dataset_name == 'iu-xray':
             split_path = f'iu_xray_{self.split}.csv'
             self.dataset = IUXrayDataset(self.args, split_path, transform)
+
+        elif self.dataset_name == 'mimic-cxr':
+            self.dataset = MimicCXRDataset(self.args, split, transform, use_minio=self.use_minio)
         else:
             raise ValueError('Dataset not supported')
 
@@ -43,7 +48,7 @@ class CxrDataLoader(DataLoader):
         if len(data) == 0:
             return None
 
-        uid_batch, report_batch, prompt_batch, image_batch, label_batch = zip(*data)
+        uid_batch, report_batch, image_batch, label_batch = zip(*data)
 
         image_batch = torch.stack(image_batch, 0)
         label_batch = torch.stack(label_batch, 0)
@@ -56,7 +61,6 @@ class CxrDataLoader(DataLoader):
             'uid': uid_batch,
             'image': image_batch,
             'report': report_batch,
-            'prompt': prompt_batch,
             'labels': label_batch
         }
 

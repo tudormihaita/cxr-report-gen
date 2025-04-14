@@ -206,6 +206,7 @@ class CLIP(nn.Module):
                  num_medical_concepts: int = 14,
                  extended_context_length: int = 248,
                  extended_context: bool = False,
+                 load_from_clip: bool = True,
                  ):
         super().__init__()
 
@@ -242,7 +243,7 @@ class CLIP(nn.Module):
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
 
-        if self.extended_context:
+        if not load_from_clip and self.extended_context:
             self.positional_embedding = nn.Parameter(torch.empty(self.extended_context_length, transformer_width))
             self.positional_embedding_res = nn.Parameter(torch.empty(self.extended_context_length, transformer_width))
         else:
@@ -366,7 +367,7 @@ class CLIP(nn.Module):
     def forward(self, image, text, medical_concepts=None):
         image_features, cls_features = self.encode_image(image)
         text_features = self.encode_text(text)
-        concepts_logits = self.predict_medical_concepts(cls_features)['logits']
+        # concepts_logits = self.predict_medical_concepts(cls_features)['logits']
 
         # feature vectors normalized to have a unit length (L2 normalization)
         # ensures cosine similarity is calculated purely based on the angle between the vectors and not their magnitudes
@@ -385,7 +386,7 @@ class CLIP(nn.Module):
             "logits_per_text": logits_per_text,  # text-to-image similarity
             "image_features": image_features,  # projected image features
             "text_features": text_features,  # projected text features
-            "concepts_logits": concepts_logits,  # predicted medical concepts
+            # "concepts_logits": concepts_logits,  # predicted medical concepts
         }
 
         if medical_concepts is not None:
@@ -439,6 +440,7 @@ def build_model(state_dict: dict = None, extended_context: bool = False, load_fr
             transformer_heads=CLIP_TRANSFORMER_HEADS,
             transformer_layers=CLIP_TRANSFORMER_LAYERS,
             extended_context=extended_context,
+            load_from_clip=load_from_clip,
         )
         return model.train()
 
@@ -465,7 +467,7 @@ def build_model(state_dict: dict = None, extended_context: bool = False, load_fr
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
-        extended_context=extended_context,
+        extended_context=extended_context, load_from_clip=load_from_clip,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:

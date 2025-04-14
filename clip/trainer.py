@@ -12,14 +12,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 
-from clip.loss import CCALoss
+from constants import CHEXPERT_LABELS
+from clip.loss import ContrastiveConceptualAlignmentLoss
 from clip.tokenizer import CLIPTokenizer
 
 
 class CLIPTrainer:
     """
-    Trainer for fine-tuning CLIP models on the ARRG (Aligned Radiology Report Generation) task.
-    Optimizes for image-text alignment while leveraging medical concept labels.
+    Trainer for fine-tuning a foundational CLIP model on language-vision contrastive pre-training for radiology image datasets.
     """
 
     def __init__(
@@ -28,29 +28,28 @@ class CLIPTrainer:
             train_loader,
             val_loader=None,
             test_loader=None,
+            num_epochs=None,
             device='cuda' if torch.cuda.is_available() else 'cpu',
-            threshold=0.7,
             learning_rate=1e-5,
-            weight_decay=0.01,
-            warmup_steps=1000,
-            max_steps=100000,
+            weight_decay=0.2,
+            warmup_steps=500,
+            max_steps=30000,
             output_dir='./output',
             log_interval=100,
             save_interval=1000,
             gradient_accumulation_steps=1,
             mixed_precision=True,
-            weighted_loss=False,
-            multi_task=True,
             max_grad_norm=1.0
     ):
         """
-        Initialize the CLIP Medical Trainer.
+        Initializes the trainer.
 
-        :param model: CLIP model with medical concept prediction capabilities
+        :param model: CLIP foundational model
         :param train_loader: DataLoader for training data
         :param val_loader: DataLoader for validation data
         :param test_loader: DataLoader for test data (optional)
         :param device: device to train on ('cuda' or 'cpu')
+        :param num_epochs: number of epochs to train for (if None, max_steps is used)
         :param learning_rate: learning rate for optimizer
         :param weight_decay: weight decay for regularization
         :param warmup_steps: number of warmup steps for learning rate scheduler
@@ -70,42 +69,21 @@ class CLIPTrainer:
         self.test_loader = test_loader
 
         self.device = device
-        self.threshold = threshold
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
         self.output_dir = output_dir
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.mixed_precision = mixed_precision
         self.max_grad_norm = max_grad_norm
-        self.multi_task = multi_task
 
         os.makedirs(output_dir, exist_ok=True)
 
         self.logger = self.__setup_logger(__name__)
 
-        self.pos_weights = self.__compute_pos_weights(
-            dataloader=self.train_loader,
-            num_classes=self.model.num_classes,
-            device=self.device
-        ) if weighted_loss else None
-
-        self.loss_fn = CCALoss(
-            temperature=0.2,
-            concept_weight=0.2 if multi_task else 0.0,
-            concept_sim_weight=0.2 if multi_task else 0.0,
-            pos_weight=self.pos_weights,
-        )
-        self.eval_loss_fn = CCALoss(
-            temperature=0.2,
-            concept_weight=0.2 if multi_task else 0.0,
-            concept_sim_weight=0.2 if multi_task else 0.0,
-            pos_weight=None,
-            eval_mode=True
-        )
+        self.loss_fn = ContrastiveConceptualAlignmentLoss(use_soft_concept_loss=False)
 
         concept_params = [p for n, p in model.named_parameters() if
                           ("medical_concept" in n or "concept_embedding" in n) and p.requires_grad]
@@ -117,9 +95,21 @@ class CLIPTrainer:
             {"params": clip_params, "lr": learning_rate}
         ]
 
+        # freeze non-used auxiliary classification head
+        for param in concept_params:
+            param.requires_grad = False
+
+        steps_per_epoch = len(train_loader)
+        if num_epochs is not None:
+            self.num_epochs = num_epochs
+            self.max_steps = steps_per_epoch * num_epochs
+        else:
+            self.max_steps = max_steps
+            self.num_epochs = (max_steps + steps_per_epoch - 1) // steps_per_epoch
+
         # set up optimizer and scheduler
         self.optimizer = AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay)
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_steps)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.max_steps)
 
         # set up gradient scaler for mixed precision training
         self.scaler = GradScaler('cuda') if mixed_precision and device == 'cuda' else None
@@ -171,17 +161,13 @@ class CLIPTrainer:
         pos_weights = total_neg / (total_pos + 1e-8)
         return pos_weights
 
-    def train(self, epochs=None):
+    def train(self):
         self.logger.info("Starting training")
         self.model.train()
 
-        if epochs is None:
-            steps_per_epoch = len(self.train_loader)
-            epochs = (self.max_steps + steps_per_epoch - 1) // steps_per_epoch
-
-        for epoch in range(epochs):
+        for epoch in range(self.num_epochs):
             self.epoch = epoch
-            self.logger.info(f"Starting epoch {epoch + 1}/{epochs}")
+            self.logger.info(f"Starting epoch {epoch + 1}/{self.num_epochs}")
 
             epoch_loss = 0.0
             epoch_start_time = time.time()
@@ -228,8 +214,8 @@ class CLIPTrainer:
 
     def train_step(self, batch):
         images = batch['image'].to(self.device)
-        text_tokens = self.tokenizer.encode(batch['prompt'], truncate=True, extended_context=self.model.extended_context).to(self.device)
-        medical_concepts = batch['labels'].to(self.device)
+        text_tokens = self.tokenizer.encode(batch['report'], truncate=True, extended_context=self.model.extended_context).to(self.device)
+        labels = batch['labels'].to(self.device)
 
         # batch attention mask not used in this context for pretraining CLIP, due to using pre-computed causal mask
 
@@ -240,11 +226,11 @@ class CLIPTrainer:
         # forward pass with mixed precision if enabled
         if self.mixed_precision and self.device == 'cuda':
             with autocast('cuda'):
-                outputs = self.model(images, text_tokens, medical_concepts)
+                outputs = self.model(images, text_tokens)
 
-                loss, loss_dict = self.loss_fn(outputs, medical_concepts)
+                loss, loss_dict = self.loss_fn(outputs, labels)
 
-                original_loss = loss_dict['total_loss']
+                original_loss = loss_dict['clip_loss']
                 loss = loss / self.gradient_accumulation_steps
 
             # backward pass with scaled gradients
@@ -261,11 +247,11 @@ class CLIPTrainer:
                 self.scaler.update()
                 self.scheduler.step()
         else:
-            outputs = self.model(images, text_tokens, medical_concepts)
+            outputs = self.model(images, text_tokens)
 
-            loss, loss_dict = self.loss_fn(outputs, medical_concepts)
+            loss, loss_dict = self.loss_fn(outputs, labels)
 
-            original_loss = loss_dict['total_loss']
+            original_loss = loss_dict['clip_loss']
             # scale loss by gradient accumulation steps
             loss = loss / self.gradient_accumulation_steps
 
@@ -288,170 +274,160 @@ class CLIPTrainer:
         phase = "test" if test else "val"
 
         total_loss = 0.0
-        all_img_embeds, all_text_embeds, all_concept_embeds = [], [], []
-        all_concepts_pred , all_concepts_gt = [], []
+        all_img_embeds, all_text_embeds, all_labels = [], [], []
 
-        self.logger.info(f"Running evaluation on {phase} set")
-
-        for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
+        for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation", position=0, leave=True, dynamic_ncols=True):
             images = batch['image'].to(self.device)
-            text_tokens = self.tokenizer.encode(batch['prompt'], truncate=True).to(self.device)
-            medical_concepts = batch['labels'].to(self.device)
+            text_tokens = self.tokenizer.encode(batch['report'], truncate=True, extended_context=self.model.extended_context).to(self.device)
+            labels = batch['labels'].to(self.device)
 
-            outputs = self.model(images, text_tokens, medical_concepts)
+            outputs = self.model(images, text_tokens)
 
-            loss, loss_dict = self.eval_loss_fn(outputs, medical_concepts)
+            loss, loss_dict = self.loss_fn(outputs, labels)
 
             # store predictions and ground truth
-            total_loss += loss_dict["total_loss"]
+            total_loss += loss_dict["clip_loss"]
 
-            # store embeddings and predictions for later analysis
+            all_labels.append(labels.cpu())
             all_img_embeds.append(outputs['image_features'].cpu())
             all_text_embeds.append(outputs['text_features'].cpu())
-            if 'concepts_embeddings' in outputs:
-                all_concept_embeds.append(outputs['concepts_embeddings'].cpu())
-
-            # store concept predictions for metrics calculation
-            concepts_pred = torch.sigmoid(outputs['concepts_logits']).cpu().numpy()
-            all_concepts_pred.append(concepts_pred)
-
-            # convert uncertain (-1) to masked values for metrics calculation
-            concepts_gt = medical_concepts.clone().cpu().numpy()
-            concepts_gt[concepts_gt == -1] = 0  # replace uncertain with 0 for relevant metrics
-            mask = (concepts_gt != -1)
-            all_concepts_gt.append((concepts_gt, mask))
 
         # calculate average loss
         avg_loss = total_loss / len(dataloader)
         metrics = {f"{phase}_loss": avg_loss}
-
-        if self.multi_task:
-            # concatenate predictions and ground truth
-            all_concepts_pred = np.concatenate(all_concepts_pred, axis=0)
-
-            # calculate AUC for concept classification
-            if len(all_concepts_gt) > 0:
-                # combine all masks and ground truth
-                all_gt = np.concatenate([gt for gt, _ in all_concepts_gt], axis=0)
-                all_masks = np.concatenate([mask for _, mask in all_concepts_gt], axis=0)
-
-                # calculate AUC per concept
-                aucs = []
-                for i in range(self.model.num_classes):
-                    concept_mask = all_masks[:, i]
-                    if concept_mask.sum() > 0:  # only calculate if we have non-masked values
-                        try:
-                            auc = roc_auc_score(all_gt[concept_mask, i], all_concepts_pred[concept_mask, i])
-                            aucs.append(auc)
-                        except ValueError:
-                            self.logger.warning(f"Concept mask {i} is empty, AUC failed to compute.")
-                            continue
-
-
-                # calculate precision, recall, and F1 score
-                thresholds = [0.4, 0.5, 0.7]
-                best_classification_metrics = {}
-                best_f1 = 0.0
-
-                for t in thresholds:
-                    f1s, precisions, recalls = [], [], []
-                    for i in range(self.model.num_classes):
-                        concept_mask = all_masks[:, i]
-                        if concept_mask.sum() > 0:
-                            pred_labels = (all_concepts_pred[concept_mask, i] > t).astype(int)
-                            precision, recall, f1, _ = precision_recall_fscore_support(
-                                all_gt[concept_mask, i],
-                                pred_labels,
-                                average='binary',
-                                zero_division=0
-                            )
-                            precisions.append(precision)
-                            recalls.append(recall)
-                            f1s.append(f1)
-
-                    mean_f1 = np.mean(f1s)
-                    if mean_f1 > best_f1:
-                        best_f1 = mean_f1
-                        best_classification_metrics = {
-                            f"{phase}_best_threshold": t,
-                            f"{phase}_mean_f1": mean_f1,
-                            f"{phase}_mean_precision": np.mean(precisions),
-                            f"{phase}_mean_recall": np.mean(recalls)
-                        }
-
-                metrics.update(best_classification_metrics)
-                if aucs:
-                    metrics[f"{phase}_concept_auc_avg"] = np.mean(aucs)
 
         # calculate retrieval metrics
         if len(all_img_embeds) > 0 and len(all_text_embeds) > 0:
             # concatenate all embeddings
             img_embeds = torch.cat(all_img_embeds, dim=0)
             text_embeds = torch.cat(all_text_embeds, dim=0)
+            labels_tensor = torch.cat(all_labels, dim=0)
 
             # normalize embeddings for cosine similarity
-            img_embeds = img_embeds / img_embeds.norm(dim=1, keepdim=True)
-            text_embeds = text_embeds / text_embeds.norm(dim=1, keepdim=True)
+            # img_embeds = img_embeds / img_embeds.norm(dim=1, keepdim=True)
+            # text_embeds = text_embeds / text_embeds.norm(dim=1, keepdim=True)
 
+            img_embeds = img_embeds.to(self.device)
+            text_embeds = text_embeds.to(self.device)
+
+            logit_scale = self.model.logit_scale.exp().clamp(max=100)
             # calculate similarity scores
-            similarity = (img_embeds @ text_embeds.T).numpy()
+            similarity = (logit_scale * (img_embeds @ text_embeds.T)).cpu().numpy()
 
-            # calculate retrieval metrics: not relevant for now
+            # calculate retrieval metrics
             metrics.update(self._calculate_retrieval_metrics(similarity, phase))
 
-            embedding_data = []
-            for i in range(img_embeds.shape[0]):
-                embedding_data.append({
-                    "uid": f"img_{i}",
-                    "type": "image",
-                    "embedding": img_embeds[i].cpu().numpy()
-                })
+            # calculate zero-shot accuracy
+            metrics.update(self._calculate_zero_shot_accuracy(img_embeds, labels_tensor, phase))
 
-            for i in range(text_embeds.shape[0]):
-                embedding_data.append({
-                    "uid": f"text_{i}",
-                    "type": "text",
-                    "embedding": text_embeds[i].cpu().numpy()
-                })
-
-            emb_df = pd.DataFrame(embedding_data)
-            emb_df.to_pickle(os.path.join(self.output_dir, f"{phase}_embeddings.pkl"))
+            # save embeddings for further analysis
+            # self.save_embeddings(img_embeds, text_embeds, phase)
 
         # log metrics
+        formatted_metrics = {k: round(float(v), 10) for k, v in metrics.items() }
         self.logger.info(
-            f"{phase.capitalize()} metrics: {json.dumps({k: float(v) for k, v in metrics.items()}, indent=2)}")
+            f"{phase.capitalize()} metrics: {json.dumps(formatted_metrics, indent=2)}")
 
         self.model.train()
         return metrics
 
     @staticmethod
     def _calculate_retrieval_metrics(similarity, phase):
-        """Calculate retrieval metrics (recall@k) from similarity matrix."""
+        """
+        Calculate retrieval metrics (recall@k) from similarity matrix.
+        :param similarity: similarity matrix of shape (batch_size, batch_size) where each entry is the cosine similarity between image and text pairs.
+        :param phase: phase of evaluation ('val', 'test')
+        """
         metrics = {}
         batch_size = similarity.shape[0]
 
-        # get indices of highest similarities
-        ranks = {}
-        for retrieval_type in ['i2t', 't2i']:  # image-to-text and text-to-image
-            if retrieval_type == 'i2t':
-                # for each image, find the rank of the correct text
-                ranked_sim = np.argsort(similarity, axis=1)[:, ::-1]
-                ranks[retrieval_type] = np.where(ranked_sim == np.arange(batch_size)[:, np.newaxis])[1]
-            else:
-                # for each text, find the rank of the correct image
-                ranked_sim = np.argsort(similarity.T, axis=1)[:, ::-1]
-                ranks[retrieval_type] = np.where(ranked_sim == np.arange(batch_size)[:, np.newaxis])[1]
+        # for each image, rank all texts
+        ranked_sim = np.argsort(similarity, axis=1)[:, ::-1]
+        ranks = np.array([
+            np.where(ranked_sim[i] == i)[0][0]
+            for i in range(batch_size)
+        ])
 
-        # calculate recall@k
+        # calculate recall@k for k in [1, 5, 10]
         for k in [1, 5, 10]:
-            for retrieval_type in ['i2t', 't2i']:
-                metrics[f"{phase}_{retrieval_type}_recall@{k}"] = (ranks[retrieval_type] < k).mean()
+            recall = (ranks < k).mean()
+            metrics[f"{phase}_recall@{k}"] = recall
 
-        # calculate median rank
-        for retrieval_type in ['i2t', 't2i']:
-            metrics[f"{phase}_{retrieval_type}_median_rank"] = np.median(ranks[retrieval_type]) + 1
+        median_rank = np.median(ranks) + 1
+        mrr = np.mean(1.0 / (ranks + 1))
+        metrics[f"{phase}_median_rank"] = median_rank
+        metrics[f"{phase}_mrr"] = mrr
 
         return metrics
+
+    def _calculate_zero_shot_accuracy(self, image_embeds, labels, phase):
+        image_embeds = image_embeds.to(self.device)
+        labels = labels.to(self.device)
+
+        accuracy_per_class = []
+        total_valid = 0
+
+        for index, classname in enumerate(CHEXPERT_LABELS):
+            # handle "no finding" class separately
+            if classname.lower() == "no finding":
+                prompts = [f"No Finding", "Abnormal"]
+            else:
+                prompts = [f"{classname}", f"No {classname}"]
+
+            text_tokens = self.tokenizer.encode(prompts, truncate=True, extended_context=self.model.extended_context).to(self.device)
+            text_features = self.model.encode_text(text_tokens)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+
+            logit_scale = self.model.logit_scale.exp().clamp(max=100)
+            logits = logit_scale * image_embeds @ text_features.T
+
+            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            class_labels = labels[:, index].cpu().numpy()
+            mask = class_labels != -1
+            if mask.sum() > 0:
+                y_true = class_labels[mask]
+                y_score = probs[:, 0][mask]
+
+                try:
+                    auc = roc_auc_score(y_true, y_score)
+                    accuracy_per_class.append(auc)
+                except:
+                    accuracy_per_class.append(0.0)
+
+                total_valid += mask.sum()
+
+        mean_auc = np.mean(accuracy_per_class) if accuracy_per_class else 0.0
+        per_class_accuracy = {
+            f"{phase}_zs_auc_{classname.lower().replace(' ', '_')}": acc
+            for classname, acc in zip(CHEXPERT_LABELS, accuracy_per_class)
+        }
+
+        return {
+            f"{phase}_mean_auc": mean_auc,
+            **per_class_accuracy
+        }
+
+    def save_embeddings(self, img_embeds, text_embeds, phase):
+        embedding_data = []
+        for i in range(img_embeds.shape[0]):
+            embedding_data.append({
+                "uid": f"img_{i}",
+                "type": "image",
+                "embedding": img_embeds[i].cpu().numpy()
+            })
+
+        for i in range(text_embeds.shape[0]):
+            embedding_data.append({
+                "uid": f"text_{i}",
+                "type": "text",
+                "embedding": text_embeds[i].cpu().numpy()
+            })
+
+        emb_df = pd.DataFrame(embedding_data)
+        emb_df.to_pickle(os.path.join(self.output_dir, f"{phase}_embeddings.pkl"))
+
 
     def save_checkpoint(self, step=None, is_best=False):
         checkpoint = {

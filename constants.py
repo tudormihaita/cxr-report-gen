@@ -1,7 +1,6 @@
 import os
 
 VIT_TYPE = "ViT-B/32"
-
 CLIP_CONTEXT_LENGTH = 77
 CLIP_EXTENDED_CONTEXT_LENGTH = 248
 CLIP_IMAGE_RESOLUTION = 224
@@ -18,17 +17,17 @@ CLIP_EMBED_DIM = 512
 BART_TYPE = "facebook/bart-base"
 BART_CONTEXT_LENGTH = 256
 
-ROOT_PATH = '/Volumes/T7 Shield/datasets/'
+ROOT_PATH = '/Volumes/T7 Shield/'
 
 DATASETS_PATH = {
-    'iu-xray': os.path.join(ROOT_PATH, 'iu-xray'),
+    'iu-xray': os.path.join(ROOT_PATH, 'datasets', 'iu-xray'),
     'mimic-cxr': os.path.join(ROOT_PATH, 'mimic-cxr')
 }
 
-IMAGES_PATH = {
-    'iu-xray': os.path.join(DATASETS_PATH['iu-xray'], 'images/images_normalized'),
-    'mimic-cxr': os.path.join(DATASETS_PATH['mimic-cxr'], 'images') # to be updated
-}
+IU_XRAY_IMAGES_PATH = 'images/images_normalized'
+
+MIMIC_IMAGES_PATH = 'images-normalized'
+MIMIC_REPORTS_PATH = 'reports'
 
 CHEXPERT_LABELS = [
     'Atelectasis',
