@@ -11,7 +11,7 @@ from utils.minio import MinioUtils
 from constants import DATASETS_PATH, CHEXPERT_LABELS, IU_XRAY_IMAGES_PATH, MIMIC_IMAGES_PATH
 
 
-def build_iu_xray_sampler(split, label_columns=CHEXPERT_LABELS):
+def _build_iu_xray_sampler(split, label_columns=CHEXPERT_LABELS):
     """
     Create a weighted sampler for the IU-Xray dataset based on the labels.
     :param split: the split of the dataset (train, val, test)
@@ -61,9 +61,10 @@ class MimicCXRDataset(Dataset):
         self.transform = transform
 
         if self.use_minio:
-            self.dataset = MinioUtils.load_csv_from_minio( f'mimic-cxr/processed/mimic-cxr_{split}.csv')
+            self.dataset = MinioUtils.load_csv_from_minio(f'mimic-cxr/processed/mimic-cxr_{split}.csv')
         else:
-            self.dataset = pd.read_csv(os.path.join(str(DATASETS_PATH['mimic-cxr']), 'processed', f'mimic-cxr_{split}.csv'))
+            self.dataset = pd.read_csv(
+                os.path.join(str(DATASETS_PATH['mimic-cxr']), 'processed', f'mimic-cxr_{split}.csv'))
 
     def __len__(self):
         return len(self.dataset)
@@ -77,7 +78,7 @@ class MimicCXRDataset(Dataset):
         labels = torch.tensor(labels_array, dtype=torch.float).squeeze(0)
 
         if self.use_minio:
-            image_path=f'mimic-cxr/{MIMIC_IMAGES_PATH}/{entry["image_path"]}'
+            image_path = f'mimic-cxr/{MIMIC_IMAGES_PATH}/{entry["image_path"]}'
             image = MinioUtils.load_image_from_minio(image_path)
         else:
             image_path = os.path.join(str(DATASETS_PATH['mimic-cxr']), MIMIC_IMAGES_PATH, entry['image_path'])
