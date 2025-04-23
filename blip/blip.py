@@ -15,13 +15,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from model import create_vit, init_tokenizer
-from bert import BertConfig, BertModel, BertLMHeadModel
+from .model import create_vit, init_tokenizer
+from .bert import BertConfig, BertModel, BertLMHeadModel
 
 
 class BLIP(nn.Module):
     def __init__(self,
-                 config='configs/bert_config.json',
+                 config='../configs/bert.json',
                  image_size=224,
                  vit='base',
                  vit_grad_ckpt=False,
@@ -56,7 +56,6 @@ class BLIP(nn.Module):
         encoder_config.encoder_width = vision_width
         self.text_encoder = BertModel.from_pretrained('bert-base-uncased', config=encoder_config,
                                                       add_pooling_layer=False)
-
         self.text_encoder.resize_token_embeddings(len(self.tokenizer))
 
         text_width = self.text_encoder.config.hidden_size
@@ -70,6 +69,7 @@ class BLIP(nn.Module):
         self.vision_proj_m = nn.Linear(vision_width, embed_dim)
         self.text_encoder_m = BertModel(config=encoder_config, add_pooling_layer=False)
         self.text_proj_m = nn.Linear(text_width, embed_dim)
+        self.text_encoder_m.resize_token_embeddings(len(self.tokenizer))
 
         self.model_pairs = [[self.visual_encoder, self.visual_encoder_m],
                             [self.vision_proj, self.vision_proj_m],
@@ -140,7 +140,8 @@ class BLIP(nn.Module):
 
         loss_ita = (loss_i2t + loss_t2i) / 2
 
-        self._dequeue_and_enqueue(image_feat_m, text_feat_m)
+        if self.training:
+            self._dequeue_and_enqueue(image_feat_m, text_feat_m)
 
         ###============== Image-text Matching ===================###
         encoder_input_ids = text.input_ids.clone()
@@ -260,6 +261,9 @@ def concat_all_gather(tensor):
     Performs all_gather operation on the provided tensors.
     *** Warning ***: torch.distributed.all_gather has no gradient.
     """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return tensor
+
     tensors_gather = [torch.ones_like(tensor)
                       for _ in range(torch.distributed.get_world_size())]
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)

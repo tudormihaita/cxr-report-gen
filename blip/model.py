@@ -8,10 +8,6 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-from vit import VisionTransformer, interpolate_pos_embed
-from bert import BertConfig, BertModel, BertLMHeadModel
-from transformers import BertTokenizer
-
 import torch
 from torch import nn
 
@@ -19,10 +15,14 @@ import os
 from urllib.parse import urlparse
 from timm.models.hub import download_cached_file
 
+from transformers import BertTokenizer
+from .vit import VisionTransformer, interpolate_pos_embed
+from .bert import BertConfig, BertModel, BertLMHeadModel
+
 
 class BLIPFeatureExtractor(nn.Module):
     def __init__(self,
-                 config='configs/bert_config.json',
+                 config='../configs/blip.json',
                  image_size=224,
                  vit='base',
                  vit_grad_ckpt=False,
@@ -76,7 +76,7 @@ class BLIPFeatureExtractor(nn.Module):
 
 class BLIPDecoder(nn.Module):
     def __init__(self,
-                 config='configs/bert_config.json',
+                 config='../configs/blip.json',
                  image_size=384,
                  vit='base',
                  vit_grad_ckpt=False,

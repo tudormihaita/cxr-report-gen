@@ -200,7 +200,7 @@ class MimicCXRPreprocessor:
         df_keys = set(zip(df['subject_id'], df['study_id']))
 
         missing_keys = df_keys - merged_keys
-        print(f"Missing study_ids (not in chexpert labels): {missing_keys}")
+        print(f"Missing study_ids (not in CheXpert labels): {missing_keys}")
 
         return merged_df
 

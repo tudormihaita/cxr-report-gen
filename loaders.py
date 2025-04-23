@@ -3,6 +3,34 @@ import torch
 from torch.utils.data import DataLoader
 from datasets import IUXrayDataset, MimicCXRDataset
 
+from torchvision import transforms
+from torchvision.transforms.functional import InterpolationMode
+
+
+def build_transform(split, image_size=224, min_scale=0.5):
+    normalize = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+
+    def _convert_image_to_rgb(image):
+        return image.convert("RGB")
+
+    # TODO: add randaugment based on BLIP implementation
+    if split == 'train':
+        return transforms.Compose([
+            transforms.RandomResizedCrop(image_size, scale=(min_scale, 1.0), interpolation=InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(),
+            _convert_image_to_rgb,
+            transforms.ToTensor(),
+            normalize
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+            _convert_image_to_rgb,
+            transforms.ToTensor(),
+            normalize
+        ])
+
 
 class CxrDataLoader(DataLoader):
     def __init__(self, args, split, transform=None, sampler=None):
@@ -10,7 +38,6 @@ class CxrDataLoader(DataLoader):
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
         self.dataset_name = args.dataset_name
-        self.max_seq_length = args.max_seq_length
         self.use_minio = args.use_minio
 
         self.split = split
@@ -52,10 +79,6 @@ class CxrDataLoader(DataLoader):
 
         image_batch = torch.stack(image_batch, 0)
         label_batch = torch.stack(label_batch, 0)
-
-        # TODO: move mask computation and tokenization outside batch
-        # padding mask used in conditional generation input to prevent attending to padded text tokens
-        # mask_batch = (tokenized_texts_batch != 0).long()
 
         return {
             'uid': uid_batch,

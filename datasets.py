@@ -11,7 +11,7 @@ from utils.minio import MinioUtils
 from constants import DATASETS_PATH, CHEXPERT_LABELS, IU_XRAY_IMAGES_PATH, MIMIC_IMAGES_PATH
 
 
-def _build_iu_xray_sampler(split, label_columns=CHEXPERT_LABELS):
+def _build_weighted_sampler(split, label_columns=CHEXPERT_LABELS):
     """
     Create a weighted sampler for the IU-Xray dataset based on the labels.
     :param split: the split of the dataset (train, val, test)

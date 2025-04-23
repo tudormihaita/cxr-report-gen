@@ -18,7 +18,7 @@ class MinioUtils:
                     endpoint=os.getenv("MINIO_ENDPOINT"),
                     access_key=os.getenv("MINIO_ACCESS_KEY"),
                     secret_key=os.getenv("MINIO_SECRET_KEY"),
-                    secure=False,
+                    secure=True,
                 )
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize Minio client: {e}")
