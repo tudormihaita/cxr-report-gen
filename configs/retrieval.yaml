@@ -1,9 +1,6 @@
-# dataset paths and checkpoints
-train_file: [
-  '/export/share/junnan-li/VL_pretrain/annotation/coco_karpathy_train.json',
-  '/export/share/junnan-li/VL_pretrain/annotation/vg_caption.json',
-]
+# set pretrained as a file path or an url
 pretrained: 'https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_base_retrieval_coco.pth'
+# pretrained: 'https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_base.pth'
 
 # size of vit model; base or large
 vit: 'base'
@@ -11,17 +8,16 @@ vit_grad_ckpt: False
 vit_ckpt_layer: 0
 
 image_size: 224
-#batch_size: 64
+# batch_size: 64
 batch_size: 32
-#max_length: 67
+# max_length: 67
 max_length: 143
 
 queue_size: 57600
-#queue_size: 32768
 alpha: 0.4
 
-log_interval: 300
-save_interval: 5000
+log_interval: 100
+save_interval: 6000
 gradient_accumulation_steps: 1
 max_grad_norm: 1.0
 
@@ -31,6 +27,6 @@ init_lr: 2e-5
 min_lr: 5e-6
 warmup_lr: 1e-7
 lr_decay_rate: 0.95
-max_epochs: 20
+max_epochs: 50
 max_steps: 200000
-warmup_steps: 2000
+warmup_steps: 200

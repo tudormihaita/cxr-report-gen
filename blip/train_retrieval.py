@@ -19,14 +19,7 @@ def warmup_lr_schedule(optimizer, step, max_step, init_lr, max_lr):
         param_group['lr'] = lr
 
 
-def step_lr_schedule(optimizer, epoch, init_lr, min_lr, decay_rate):
-    """Exponential decay of learning rate"""
-    lr = max(min_lr, init_lr * (decay_rate ** epoch))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-class BLIPTrainer:
+class BLIPRetrievalTrainer:
     def __init__(self,
                  model,
                  config,
@@ -34,7 +27,7 @@ class BLIPTrainer:
                  val_loader=None,
                  test_loader=None,
                  device='cuda' if torch.cuda.is_available() else 'cpu',
-                 output_dir='./output/pretrain',
+                 output_dir='./output/retrieval',
                  mixed_precision=True,
                  ):
         self.device = device
@@ -81,11 +74,6 @@ class BLIPTrainer:
             weight_decay=self.weight_decay,
             betas=(0.9, 0.999)
         )
-        # self.scheduler = CosineAnnealingLR(
-        #     self.optimizer,
-        #     T_max=self.max_steps - self.warmup_steps,
-        #     eta_min=self.min_lr
-        # )
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer,
             T_0=self.max_steps - self.warmup_steps,
@@ -140,7 +128,6 @@ class BLIPTrainer:
             self.logger.info(
                 f"Epoch {epoch + 1} completed in {epoch_time:.2f}s. Average loss: {avg_loss:.4f}")
 
-            # TODO: add evaluate_every no. steps attribute
             val_metrics = self.evaluate()
             if val_metrics['val_loss'] < self.best_val_loss:
                 self.best_val_loss = val_metrics['val_loss']
@@ -159,18 +146,17 @@ class BLIPTrainer:
 
     def train_step(self, batch):
         images = batch['image'].to(self.device)
-        reports = batch['report']
-        captions = batch['caption']
-        labels = batch['labels'].to(self.device)
+        captions = batch['report']
+        idxs = batch['idx']
 
         if self.global_step < self.warmup_steps:
             warmup_lr_schedule(self.optimizer, self.global_step, self.warmup_steps, self.warmup_lr, self.init_lr)
 
         if self.scaler is not None:
             with autocast('cuda'):
-                loss_ita, loss_itm, loss_lm = self.model(images, reports, labels, alpha=self.alpha)
+                loss_ita, loss_itm = self.model(images, captions, idxs, alpha=self.alpha)
 
-                loss = 1.0 * loss_ita + 1.0 * loss_itm + 1.0 * loss_lm
+                loss = 1.0 * loss_ita + 1.0 * loss_itm
                 scaled_loss = loss / self.grad_accumulation_steps
 
             self.scaler.scale(scaled_loss).backward()
@@ -186,9 +172,9 @@ class BLIPTrainer:
                 if self.global_step >=  self.warmup_steps:
                     self.scheduler.step()
         else:
-            loss_ita, loss_itm, loss_lm = self.model(images, reports, labels, alpha=self.alpha)
+            loss_ita, loss_itm = self.model(images, captions, idxs, alpha=self.alpha)
 
-            loss = 1.0 * loss_ita + 1.0 * loss_itm + 1.0 * loss_lm
+            loss = 1.0 * loss_ita + 1.0 * loss_itm
             scaled_loss = loss / self.grad_accumulation_steps
 
             scaled_loss.backward()
@@ -209,24 +195,22 @@ class BLIPTrainer:
         dataloader = self.test_loader if test else self.val_loader
         phase = "test" if test else "val"
 
-        total_loss, ita_loss, itm_loss, lm_loss = 0.0, 0.0, 0.0, 0.0
+        total_loss, ita_loss, itm_loss = 0.0, 0.0, 0.0
         uids = []
         image_embeds, text_embeds = [], []
 
         for batch in tqdm(dataloader, desc="Evaluation"):
             images = batch['image'].to(self.device)
-            reports = batch['report']
             captions = batch['caption']
-            labels = batch['labels'].to(self.device)
+            idxs = batch['idx']
             uids.extend(batch['uid'])
 
-            loss_ita, loss_itm, loss_lm = self.model(images, reports, labels, alpha=self.alpha)
-            total_loss += (2.0 * loss_ita + 1.0 * loss_itm + 0.5 * loss_lm).item()
-            ita_loss += 2.0 * loss_ita.item()
+            loss_ita, loss_itm = self.model(images, captions, idxs, alpha=self.alpha)
+            total_loss += (1.0 * loss_ita + 1.0 * loss_itm).item()
+            ita_loss += 1.0 * loss_ita.item()
             itm_loss += 1.0 * loss_itm.item()
-            lm_loss += 0.5 * loss_lm.item()
 
-            text_input = self.model.tokenizer(reports, padding='max_length', truncation=True,
+            text_input = self.model.tokenizer(captions, padding='max_length', truncation=True,
                                               max_length=self.max_length,
                                               return_tensors='pt').to(self.device)
             text_output = self.model.text_encoder(
@@ -257,7 +241,6 @@ class BLIPTrainer:
             f"{phase}_loss": avg_loss,
             f"{phase}_ita_loss": ita_loss / len(dataloader),
             f"{phase}_itm_loss": itm_loss / len(dataloader),
-            f"{phase}_lm_loss": lm_loss / len(dataloader),
         }
         eval_metrics.update(retrieval_metrics)
 
@@ -277,7 +260,7 @@ class BLIPTrainer:
         :return: dict of retrieval metrics
         """
         uid_to_idx = {uid: idx for idx, uid in enumerate(uids)}
-        # Image- > Text retrieval
+        # Image -> Text retrieval
         i2t_ranks = np.zeros(similarity_matrix.shape[0])
         for idx, scores in enumerate(similarity_matrix):
             query_uid = uids[idx]
@@ -357,8 +340,8 @@ class BLIPTrainer:
 
         if is_best:
             if suffix:
-                best_path = os.path.join(self.output_dir, f'blip_cxr_pretrain_{suffix}.pt')
+                best_path = os.path.join(self.output_dir, f'blip_cxr_retrieval_{suffix}.pt')
             else:
-                best_path = os.path.join(self.output_dir, 'blip_cxr_pretrain.pt')
+                best_path = os.path.join(self.output_dir, 'blip_cxr_retrieval.pt')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model to {best_path}")

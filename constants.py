@@ -13,9 +13,11 @@ CLIP_TRANSFORMER_WIDTH = 512
 CLIP_TRANSFORMER_HEADS = 8
 CLIP_EMBED_DIM = 512
 
+BLIP_BASE_VIT = "https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth"
 
 BART_TYPE = "facebook/bart-base"
-BART_CONTEXT_LENGTH = 256
+BLIP_BERT_TYPE = "bert-base-uncased"
+BLIP_SPECIALIZED_BERT_TYPE = "microsoft/BiomedVLP-CXR-BERT-specialized"
 
 ROOT_PATH = '/Volumes/T7 Shield/'
 

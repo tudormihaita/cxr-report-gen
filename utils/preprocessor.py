@@ -88,26 +88,36 @@ class IUXrayPreprocessor:
 
 
 class MimicCXRPreprocessor:
-    def __init__(self, data_path=DATASETS_PATH['mimic-cxr']):
+    def __init__(self, data_path=DATASETS_PATH['mimic-cxr'], use_cxr_pro=False):
         self.mimic_cxr = None
         self.data_path = data_path
+        self.use_cxr_pro = use_cxr_pro
+
         self.chexpert_labels = pd.read_csv(os.path.join(self.data_path, 'mimic-cxr-2.0.0-chexpert.csv.gz'), compression='gzip')
         self.mimic_splits = pd.read_csv(os.path.join(self.data_path, 'mimic-cxr-2.0.0-split.csv.gz'), compression='gzip')
+        self.cxr_pro_reports = pd.read_csv(os.path.join(self.data_path, 'mimic-cxr-pro-impressions.csv')) if use_cxr_pro else None
 
         self.images_path = os.path.join(str(self.data_path), MIMIC_IMAGES_PATH)
         self.reports_path = os.path.join(str(self.data_path), MIMIC_REPORTS_PATH)
 
     def preprocess(self):
         self._clean_data()
-        self.mimic_cxr = self._find_image_report_pairs()
-        self.mimic_cxr = self._extract_sections(self.mimic_cxr)
+        if self.use_cxr_pro:
+            self.mimic_cxr = self.map_xrays_to_cxr_pro_reports()
+        else:
+            self.mimic_cxr = self.map_xrays_to_mimic_reports()
+            self.mimic_cxr = self._extract_sections(self.mimic_cxr)
         self.mimic_cxr = self._assign_splits(self._find_labels(self.mimic_cxr))
         return self.mimic_cxr
 
     def _clean_data(self) -> None:
         self.chexpert_labels.fillna(0, inplace=True)
+        if self.use_cxr_pro:
+            self.cxr_pro_reports.fillna({'report': ''}, inplace=True)
+            self.cxr_pro_reports['subject_id'] = self.cxr_pro_reports['subject_id'].apply(lambda x: f'p{x}')
+            self.cxr_pro_reports['study_id'] = self.cxr_pro_reports['study_id'].apply(lambda x: f's{x}')
 
-    def _find_image_report_pairs(self) -> pd.DataFrame:
+    def map_xrays_to_mimic_reports(self) -> pd.DataFrame:
         data = []
 
         for p_folder in sorted(os.listdir(self.images_path)):
@@ -124,6 +134,7 @@ class MimicCXRPreprocessor:
                     study_path = os.path.join(subject_path, study_id)
                     if not os.path.isdir(study_path):
                         continue
+
 
                     report_txt_file = os.path.join(self.reports_path, p_folder, subject_id, f'{study_id}.txt')
                     if not os.path.isfile(report_txt_file):
@@ -144,6 +155,49 @@ class MimicCXRPreprocessor:
                             'subject_id': subject_id,
                             'image_path': image_path,
                             'report_path': report_path
+                        })
+        return pd.DataFrame(data)
+
+    def map_xrays_to_cxr_pro_reports(self) -> pd.DataFrame:
+        data = []
+
+        for p_folder in sorted(os.listdir(self.images_path)):
+            p_path = os.path.join(str(self.images_path), p_folder)
+            if not os.path.isdir(p_path):
+                continue
+
+            for subject_id in os.listdir(p_path):
+                subject_path = os.path.join(p_path, subject_id)
+                if not os.path.isdir(subject_path):
+                    continue
+
+                for study_id in os.listdir(subject_path):
+                    study_path = os.path.join(subject_path, study_id)
+                    if not os.path.isdir(study_path):
+                        continue
+
+                    report_text = self.cxr_pro_reports[self.cxr_pro_reports['study_id'] == study_id]['report'].values
+                    if len(report_text) == 0:
+                        logger.warning(f'Missing report for images in study: {study_id}')
+                        continue
+                    report_text = report_text[0]
+                    if len(report_text) == 0:
+                        # logger.warning(f'Empty report for images in study: {study_id}')
+                        continue
+
+                    for image_filename in os.listdir(study_path):
+                        if not image_filename.endswith('.jpg'):
+                            continue
+
+                        dicom_id = os.path.splitext(image_filename)[0]
+                        image_path = os.path.join(p_folder, subject_id, study_id, image_filename)
+
+                        data.append({
+                            'dicom_id': dicom_id,
+                            'study_id': study_id,
+                            'subject_id': subject_id,
+                            'image_path': image_path,
+                            'report': report_text
                         })
         return pd.DataFrame(data)
 
