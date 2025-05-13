@@ -1,111 +1,109 @@
 import torch
-import random
+from torch.utils.data import DataLoader
 
-from torch.utils.data import DataLoader, Subset
-from data.datasets import IUXrayDataset, MimicCXRDataset
-
-from torchvision import transforms
-from torchvision.transforms.functional import InterpolationMode
-
-
-class TransformBuilder:
-    def __init__(self, image_size=224, min_scale=0.8, normalize_stats=None, interpolation=InterpolationMode.BICUBIC):
-        self.image_size = image_size
-        self.min_scale = min_scale
-        self.normalize_stats = normalize_stats or ((101.48761, 101.48761, 101.48761), (83.43944, 83.43944, 83.43944))
-        self.interpolation = interpolation
-
-    @staticmethod
-    def _convert_image_to_rgb(image):
-        return image.convert("RGB")
-
-    def build(self, split):
-        normalize = transforms.Normalize(self.normalize_stats[0], self.normalize_stats[1])
-
-        if split == 'train':
-            return transforms.Compose([
-                transforms.Resize(self.image_size, interpolation=self.interpolation),
-                transforms.RandomResizedCrop(
-                    self.image_size,
-                    scale=(self.min_scale, 1.0),
-                    ratio=(0.9, 1.1),
-                    interpolation=InterpolationMode.BICUBIC
-                ),
-                transforms.RandomAffine(
-                    degrees=5,
-                    translate=(0.05, 0.05),
-                    scale=(0.95, 1.05),
-                ),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1),
-                self._convert_image_to_rgb,
-                transforms.ToTensor(),
-                normalize
-            ])
-        else:
-            return transforms.Compose([
-                transforms.Resize(self.image_size, interpolation=InterpolationMode.BICUBIC),
-                self._convert_image_to_rgb,
-                transforms.ToTensor(),
-                normalize
-            ])
+from data import load_transform
+from data.datasets import IUXrayDataset, MimicCxrDataset, MimicCxrMVSDataset
 
 
 class CxrDataLoader(DataLoader):
-    def __init__(self, args, split, transform=None, sampler=None):
+    def __init__(self, args, split, transform_config=None, tokenizer=None, sampler=None):
         self.args = args
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
-        self.dataset_name = args.dataset_name
         self.drop_last = args.drop_last
         self.use_minio = args.use_minio
 
+        self.image_size = args.image_size
+        self.max_length = args.max_length
+        self.dataset_name = args.dataset_name
+
         self.split = split
         self.sampler = sampler
-        self.transform = transform
+        self.tokenizer = tokenizer
+        self.transform = load_transform(split=self.split, transform_config=transform_config)
+        self.collate_fn = CxrDataCollator()
 
         if self.dataset_name == 'iu-xray':
-            split_path = f'iu_xray_{self.split}.csv'
-            self.dataset = IUXrayDataset(self.args, split_path, transform)
-
+            self.dataset = IUXrayDataset(self.args, split, self.transform)
         elif self.dataset_name == 'mimic-cxr':
-            self.dataset = MimicCXRDataset(self.args, split, transform, use_minio=self.use_minio)
+            self.dataset = MimicCxrDataset(self.args, split, self.transform, use_minio=self.use_minio)
+        elif self.dataset_name == 'mimic-cxr-mvs':
+            if self.tokenizer is None:
+                raise ValueError('Tokenizer is required for MVS dataset')
+            self.collate_fn = CxrMVSDataCollator(self.tokenizer, max_length=self.max_length)
+            self.dataset = MimicCxrMVSDataset(self.args, split, self.transform, use_minio=self.use_minio)
         else:
             raise ValueError('Dataset not supported')
+
 
         self.init_kwargs = {
             'dataset': self.dataset,
             'batch_size': self.batch_size,
-            'collate_fn': self.collate_fn,
             'num_workers': self.num_workers,
-            'drop_last': self.drop_last
+            'drop_last': self.drop_last,
+            'collate_fn': self.collate_fn,
         }
 
         if self.sampler is not None:
-            self.init_kwargs['sampler'] = self.sampler
-            self.init_kwargs['shuffle'] = False
-            self.init_kwargs['batch_size'] = self.batch_size
+            self.init_kwargs.update({
+                'sampler': self.sampler,
+                'batch_size': self.batch_size,
+                'shuffle': False
+            })
         else:
             self.init_kwargs['shuffle'] = (self.split == 'train')
 
         super().__init__(**self.init_kwargs)
 
-    @staticmethod
-    def collate_fn(data):
-        data = [item for item in data if item is not None]
-        if len(data) == 0:
-            return None
 
-        uid_batch, report_batch, image_batch, label_batch, caption_batch, idx_batch = zip(*data)
+class CxrDataCollator:
+    def __call__(self, instances):
+        # uid_batch, texts, image_batch, label_batch, caption_batch, idx_batch = zip(*instances)
 
+        image_batch = torch.stack([ins["image"] for ins in instances], dim=0)
+        labels_batch = torch.stack([ins["labels"] for ins in instances], dim=0)
+        texts_batch = list([ins["text"] for ins in instances])
+        captions_batch = list([ins["caption"] for ins in instances])
+        uid_batch = list([ins["uid"] for ins in instances])
+
+        idx_batch = list([ins["idx"] for ins in instances])
         idx_batch = torch.stack([torch.tensor(idx, dtype=torch.long) for idx in idx_batch], 0)
-        image_batch = torch.stack(image_batch, 0)
-        label_batch = torch.stack(label_batch, 0)
 
         return {
             'uid': uid_batch,
             'idx': idx_batch,
             'image': image_batch,
-            'report': report_batch,
-            'labels': label_batch,
-            'caption': caption_batch
+            'report': texts_batch,
+            'labels': labels_batch,
+            'caption': captions_batch
         }
+
+
+class CxrMVSDataCollator:
+    def __init__(self, tokenizer, max_length=128):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, instances):
+        images = torch.stack([ins["image"] for ins in instances], dim=0)
+        labels = torch.stack([ins["labels"] for ins in instances], dim=0)
+        texts = list([ins["text"] for ins in instances])
+        text_tokens = self.tokenizer(texts, padding="max_length", truncation=True, return_tensors="pt",
+                                     max_length=self.max_length)
+
+        texts2 = list([ins["text2"] for ins in instances])
+        text_tokens2 = self.tokenizer(texts2, padding="max_length", truncation=True, return_tensors="pt",
+                                      max_length=self.max_length)
+        image_views = torch.stack([ins["image_view"] for ins in instances], dim=0)
+
+        batch = {
+            "images": images,
+            "image_views": image_views,
+            "texts": texts,
+            "texts2": texts2,
+            "text_tokens": text_tokens,
+            "text_tokens2": text_tokens2,
+            "labels": labels,
+        }
+
+        return batch

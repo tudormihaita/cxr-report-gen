@@ -1,0 +1,23 @@
+train:
+  RandomResizedCrop:
+    size: 224
+    scale: [0.8, 1.1]
+  CLAHE:
+    clip_limit: 4.0
+  ColorJitter:
+    brightness: 0.1
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+  CenterCrop:
+    size: 224
+valid:
+  Resize:
+    size: 224
+  CenterCrop:
+    size: 224
+test:
+  Resize:
+    size: 224
+  CenterCrop:
+    size: 224
