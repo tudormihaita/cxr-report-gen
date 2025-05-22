@@ -78,13 +78,9 @@ class CxrCLIP(nn.Module):
         image_embeddings = image_embeddings / image_embeddings.norm(dim=1, keepdim=True)
         text_embeddings = text_embeddings / text_embeddings.norm(dim=1, keepdim=True)
 
-        # labels
-        labels = torch.arange(image_embeddings.shape[0], device=device)
-
         out = {
             "image_embeddings": image_embeddings,
             "text_embeddings": text_embeddings,
-            "labels": labels,
             "logit_scale": self.logit_scale.exp(),
         }
 
@@ -98,4 +94,5 @@ class CxrCLIP(nn.Module):
         image_view_embeddings = image_view_embeddings / image_view_embeddings.norm(dim=1, keepdim=True)
         out["image_view_embeddings"] = image_view_embeddings
 
+        out["concept_labels"] = batch["labels"].to(device)
         return out

@@ -3,6 +3,7 @@ from typing import Dict
 from .combined_loss import CombinedLoss
 from .classification_loss import ClassificationLoss
 from .contrastive_loss import ImageTextContrastiveLoss
+from .lm_loss import LanguageModelingLoss
 
 
 def build_loss(all_loss_config: Dict) -> CombinedLoss:
@@ -16,6 +17,8 @@ def build_loss(all_loss_config: Dict) -> CombinedLoss:
             loss = ClassificationLoss(**cfg)
         elif loss_config == "contrastive":
             loss = ImageTextContrastiveLoss(**cfg)
+        elif loss_config == "language_modeling":
+            loss = LanguageModelingLoss(**cfg)
         else:
             raise KeyError(f"Unknown loss: {loss_config}")
 

@@ -1,9 +1,13 @@
+import torch
 import numpy as np
 import torch.nn.functional as F
 
 from sklearn import metrics
 from scipy.special import softmax
-from typing import Dict, List, Union, Tuple
+from typing import Dict, List
+
+from utils.logger import LoggerManager
+log = LoggerManager.get_logger(__name__)
 
 
 def compute_retrieval_metrics(image_embeddings, text_embeddings, text_list):
@@ -54,6 +58,112 @@ def compute_retrieval_metrics(image_embeddings, text_embeddings, text_list):
     return eval_metrics
 
 
+def compute_zeroshot_classification_metrics_from_embeddings(
+        image_embeddings,
+        class_embeddings,
+        labels,
+        class_list):
+    """
+    Compute zero-shot classification metrics using optimized thresholds per class.
+
+    :param image_embeddings: Image embeddings of shape (n_samples, embedding_dim)
+    :param class_embeddings: Dict mapping each class to prompt embeddings
+    :param labels: Ground truth labels, shape (n_samples, n_classes)
+    :param class_list: List of class names
+    :return: Dictionary with per-class metrics and average metrics
+    """
+    if isinstance(class_embeddings, dict):
+        class_emb_array = np.vstack([class_embeddings[c] for c in class_list])
+    else:
+        class_emb_array = class_embeddings
+
+    similarities = metrics.pairwise.cosine_similarity(image_embeddings, class_emb_array)
+    optimal_thresholds = compute_optimal_thresholds(similarities, labels, class_list)
+
+    results = {}
+    for i, class_name in enumerate(class_list):
+        class_scores = similarities[:, i]
+        class_labels = labels[:, i]
+        threshold = optimal_thresholds[class_name]
+
+        preds = (class_scores >= threshold).astype(int)
+
+        accuracy = metrics.accuracy_score(class_labels, preds)
+        precision = metrics.precision_score(class_labels, preds, zero_division=0)
+        recall = metrics.recall_score(class_labels, preds, zero_division=0)
+        f1 = metrics.f1_score(class_labels, preds, zero_division=0)
+        auroc = metrics.roc_auc_score(class_labels, class_scores) if len(np.unique(class_labels)) > 1 else 0.5
+
+        tn, fp, fn, tp = metrics.confusion_matrix(class_labels, preds, labels=[0, 1]).ravel()
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+        results[class_name] = {
+            "threshold": threshold,
+            "auroc": auroc,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "specificity": specificity,
+            "tp": int(tp),
+            "fp": int(fp),
+            "tn": int(tn),
+            "fn": int(fn)
+        }
+
+    avg_metrics = {
+        'auroc_avg': np.mean([results[c]['auroc'] for c in class_list]),
+        'accuracy_avg': np.mean([results[c]['accuracy'] for c in class_list]),
+        'precision_avg': np.mean([results[c]['precision'] for c in class_list]),
+        'recall_avg': np.mean([results[c]['recall'] for c in class_list]),
+        'specificity_avg': np.mean([results[c]['specificity'] for c in class_list]),
+        'f1_avg': np.mean([results[c]['f1'] for c in class_list])
+    }
+
+    results['average'] = avg_metrics
+    return results
+
+
+def compute_zeroshot_classification_metrics_from_logits(
+        image_embeddings: np.ndarray,
+        text_embeddings_by_class: Dict[str, np.ndarray],
+        labels: np.ndarray,
+        class_list: List[str]
+) -> Dict:
+    """
+    Compute zero-shot classification metrics where each class has multiple prompts.
+
+    :param image_embeddings: Image embeddings of shape (N, D)
+    :param text_embeddings_by_class: Dictionary mapping each class to prompt embeddings (multiple per class)
+    :param labels: Binary labels of shape (N, C) where C is number of classes
+    :param class_list: List of class names
+    :return: Dictionary with per-class metrics and average metrics
+    """
+    class_prompt_embeddings = {}
+
+    for class_name in class_list:
+        # for each class, prepare embeddings for negative and positive prompts
+        negative_prompt_emb = text_embeddings_by_class[f"No {class_name}"]
+        positive_prompt_emb = text_embeddings_by_class[class_name]
+
+        # if multiple embeddings per class, take the mean
+        if len(negative_prompt_emb.shape) > 1 and negative_prompt_emb.shape[0] > 1:
+            negative_prompt_emb = np.mean(negative_prompt_emb, axis=0, keepdims=True)
+
+        if len(positive_prompt_emb.shape) > 1 and positive_prompt_emb.shape[0] > 1:
+            positive_prompt_emb = np.mean(positive_prompt_emb, axis=0, keepdims=True)
+
+        # combine into [negative, positive] format
+        class_prompt_embeddings[class_name] = np.vstack([negative_prompt_emb, positive_prompt_emb])
+
+    return compute_multilabel_classification_metrics(
+        image_embeddings=image_embeddings,
+        labels=labels,
+        class_prompt_embeddings=class_prompt_embeddings,
+        class_list=class_list
+    )
+
+
 def compute_multilabel_classification_metrics_from_logits(
         predictions: np.ndarray,
         labels: np.ndarray,
@@ -63,24 +173,21 @@ def compute_multilabel_classification_metrics_from_logits(
     """
     Compute multilabel classification metrics directly from model predictions.
 
-    Args:
-        predictions: Model predictions after sigmoid of shape (N, C)
-        labels: Ground truth labels of shape (N, C) where C is number of classes
-        class_list: List of class names
-        thresholds: Classification thresholds (defaulted to a series of values from 0.1 to 0.9)
-
-    Returns:
-        Dictionary with per-class metrics and average metrics
+    :param predictions: Model predictions after sigmoid of shape (N, C)
+    :param labels: Ground truth labels of shape (N, C) where C is number of classes
+    :param class_list: List of class names
+    :param thresholds: Classification thresholds (defaulted to a series of values from 0.1 to 0.9)
+    :return: Dictionary with per-class metrics and average metrics
     """
     if thresholds is None:
-        thresholds = [0.4, 0.5, 0.6, 0.7, 0.8]
+        thresholds = np.arange(0.2, 0.6, 0.1)
 
     results = {}
-    optimal_thresholds = {}
+    optimal_thresholds = compute_optimal_thresholds(predictions, labels, class_list)
 
-    # For each class, compute binary classification metrics
+    # for each class, compute binary classification metrics
     for idx, class_name in enumerate(class_list):
-        # Extract predictions and labels for this class
+        # extract predictions and labels for this class
         class_preds = predictions[:, idx]
         class_labels = labels[:, idx]
 
@@ -94,19 +201,17 @@ def compute_multilabel_classification_metrics_from_logits(
 
         threshold_metrics = {}
         for threshold in thresholds:
-            # Convert probabilities to binary predictions
             binary_preds = (class_preds > threshold).astype(int)
 
-            # Handle edge cases where a class might have all negative examples
+            # handle edge cases where a class might have all negative examples
             if np.sum(class_labels) == 0:
                 auroc = 0.0 if np.sum(binary_preds) > 0 else 1.0
             else:
                 auroc = metrics.roc_auc_score(class_labels, class_preds)
 
-            # Calculate metrics
             accuracy = metrics.accuracy_score(class_labels, binary_preds)
 
-            # Handle edge cases for precision, recall and f1
+            # handle edge cases for precision, recall and f1
             if np.sum(binary_preds) == 0:
                 precision = 1.0 if np.sum(class_labels) == 0 else 0.0
             else:
@@ -115,7 +220,6 @@ def compute_multilabel_classification_metrics_from_logits(
             recall = metrics.recall_score(class_labels, binary_preds, zero_division=0)
             f1 = metrics.f1_score(class_labels, binary_preds, zero_division=0)
 
-            # Calculate confusion matrix elements
             tn, fp, fn, tp = metrics.confusion_matrix(class_labels, binary_preds, labels=[0, 1]).ravel()
             specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
 
@@ -137,7 +241,6 @@ def compute_multilabel_classification_metrics_from_logits(
         tn, fp, fn, tp = metrics.confusion_matrix(class_labels, optimal_binary_preds, labels=[0, 1]).ravel()
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
 
-        # Store metrics for this class
         results[class_name] = {
             "auroc": auroc,
             "optimal_threshold": optimal_threshold,
@@ -152,7 +255,6 @@ def compute_multilabel_classification_metrics_from_logits(
             "fn": int(fn)
         }
 
-    # Calculate average metrics across all classes
     avg_metrics = {
         'auroc_avg': np.mean([results[c]['auroc'] for c in class_list]),
         'accuracy_avg': np.mean([results[c]['accuracy'] for c in class_list]),
@@ -173,17 +275,14 @@ def compute_binary_classification_metrics(
         threshold=0.5,
 ) -> Dict[str, float]:
     """
-      Compute binary classification metrics for a single condition.
+    Compute binary classification metrics for a single condition.
 
-      Args:
-          image_embeddings: Image embeddings of shape (N, D)
-          condition_labels: Binary labels of shape (N,)
-          prompt_embeddings: Embeddings for [negative, positive] prompts of shape (2, D)
-          threshold: Classification threshold (default: 0.5)
-
-      Returns:
-          Dictionary with evaluation metrics
-      """
+    :param image_embeddings: Image embeddings of shape (N, D)
+    :param condition_labels: Binary labels of shape (N,)
+    :param prompt_embeddings: Embeddings for [negative, positive] prompts of shape (2, D)
+    :param threshold: Classification threshold (default: 0.5)
+    :return: Dictionary with evaluation metrics
+    """
     similarities = metrics.pairwise.cosine_similarity(image_embeddings, prompt_embeddings)
 
     probs = softmax(similarities, axis=1)
@@ -224,15 +323,12 @@ def compute_multilabel_classification_metrics(
     """
     Compute multilabel classification metrics for multiple conditions.
 
-    Args:
-        image_embeddings: Image embeddings of shape (N, D)
-        labels: Binary labels of shape (N, C) where C is number of classes
-        class_prompt_embeddings: Dict mapping each class to its prompt embeddings [negative, positive]
-        class_list: List of class names
-        threshold: Classification threshold (default: 0.5)
-
-    Returns:
-        Dictionary with per-class metrics and average metrics
+    :param image_embeddings: Image embeddings of shape (N, D)
+    :param labels: Binary labels of shape (N, C) where C is number of classes
+    :param class_prompt_embeddings: Dict mapping each class to its prompt embeddings [negative, positive]
+    :param class_list: List of class names
+    :param threshold: Classification threshold (default: 0.5)
+    :return: Dictionary with per-class metrics and average metrics
     """
     results = {}
 
@@ -266,51 +362,91 @@ def compute_multilabel_classification_metrics(
     return results
 
 
-def compute_zeroshot_classification_metrics(
-        image_embeddings: np.ndarray,
-        text_embeddings_by_class: Dict[str, np.ndarray],
-        labels: np.ndarray,
-        class_list: List[str]
-) -> Dict:
+def compute_optimal_thresholds(predictions, labels, class_list, thresholds=None):
     """
-    Compute zero-shot classification metrics where each class has multiple prompts.
+    Find the optimal classification threshold for each class using Youden's J statistic.
 
-    Args:
-        image_embeddings: Image embeddings of shape (N, D)
-        text_embeddings_by_class: Dictionary mapping each class to prompt embeddings (multiple per class)
-        labels: Binary labels of shape (N, C) where C is number of classes
-        class_list: List of class names
-
-    Returns:
-        Dictionary with per-class metrics and average metrics
+    :param predictions: Model prediction scores, shape (n_samples, n_classes)
+    :param labels: Ground truth labels, shape (n_samples, n_classes)
+    :param class_list: List of class names
+    :param thresholds: List of threshold values to try (default: range from 0.05 to 0.95)
+    :return: Dictionary mapping class names to optimal thresholds
     """
-    class_prompt_embeddings = {}
+    if thresholds is None:
+        thresholds = np.arange(0.2, 1.0, 0.1)
 
-    for class_name in class_list:
-        # for each class, prepare embeddings for negative and positive prompts
-        negative_prompt_emb = text_embeddings_by_class[f"No {class_name}"]
-        positive_prompt_emb = text_embeddings_by_class[class_name]
+    optimal_thresholds = {}
 
-        # if multiple embeddings per class, take the mean
-        if len(negative_prompt_emb.shape) > 1 and negative_prompt_emb.shape[0] > 1:
-            negative_prompt_emb = np.mean(negative_prompt_emb, axis=0, keepdims=True)
+    for i, class_name in enumerate(class_list):
+        class_scores = predictions[:, i]
+        class_labels = labels[:, i]
 
-        if len(positive_prompt_emb.shape) > 1 and positive_prompt_emb.shape[0] > 1:
-            positive_prompt_emb = np.mean(positive_prompt_emb, axis=0, keepdims=True)
+        best_threshold = 0.5
+        best_j_score = -1
 
-        # combine into [negative, positive] format
-        class_prompt_embeddings[class_name] = np.vstack([negative_prompt_emb, positive_prompt_emb])
+        for threshold in thresholds:
+            binary_preds = (class_scores > threshold).astype(int)
 
-    return compute_multilabel_classification_metrics(
-        image_embeddings=image_embeddings,
-        labels=labels,
-        class_prompt_embeddings=class_prompt_embeddings,
-        class_list=class_list
-    )
+            tn, fp, fn, tp = metrics.confusion_matrix(class_labels, binary_preds, labels=[0, 1]).ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+            # Youden's J statistic = sensitivity + specificity - 1
+            j_score = sensitivity + specificity - 1
+
+            if j_score > best_j_score:
+                best_j_score = j_score
+                best_threshold = threshold
+
+        optimal_thresholds[class_name] = best_threshold
+
+    return optimal_thresholds
 
 
 def compute_cosine_similarity(image_embeds, text_embeds):
     sims = F.cosine_similarity(image_embeds, text_embeds)
     return sims.mean().item()
 
+
+def generate_concept_prompt_embeddings(model, tokenizer, class_list, device, max_length=143):
+    """
+    Generate medical concept prompt embeddings for zero-shot classification.
+    Uses carefully engineered medical prompts for each class.
+    :param model: The CLIP model
+    :param tokenizer: Corresponding tokenizer
+    :param class_list: List of medical concept names to generate embeddings for
+    :param device: Device to run the mo on
+    :param max_length: Maximum length for tokenization
+    :return: Dictionary mapping class names to embeddings for positive and negative prompts
+    """
+    class_embeddings = {}
+
+    prompt_templates = [
+        "Chest X-ray showing {}.",
+        "Radiographic evidence of {}.",
+        "This image demonstrates findings consistent with {}.",
+        "X-ray with features of {}.",
+        "Imaging study positive for {}."
+    ]
+
+    for class_name in class_list:
+        positive_embeddings = []
+
+        with torch.no_grad():
+            for template in prompt_templates:
+                prompt = template.format(class_name)
+                tokens = tokenizer(prompt, return_tensors="pt", padding="max_length",
+                                   truncation=True, max_length=max_length).to(device)
+
+                text_features = model.encode_text(tokens)
+                if hasattr(model, "text_projection") and model.projection:
+                    text_features = model.text_projection(text_features)
+                text_features = text_features / text_features.norm(dim=1, keepdim=True)
+                positive_embeddings.append(text_features.cpu().numpy())
+
+        pos_embedding = np.mean(np.concatenate(positive_embeddings, axis=0), axis=0, keepdims=True)
+
+        class_embeddings[class_name] = pos_embedding
+
+    return class_embeddings
 

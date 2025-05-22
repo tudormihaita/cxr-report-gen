@@ -1,23 +1,23 @@
 import os
-import json
 import time
-import nltk
+import json
 import torch
+import evaluate
 import numpy as np
 
 from tqdm import tqdm
 from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
-
-from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
 from utils.loss_tracker import LossTracker
-from data.metrics import compute_retrieval_metrics, generate_concept_prompt_embeddings, \
-    compute_zeroshot_classification_metrics_from_embeddings
+
+bleu = evaluate.load("bleu")
+rouge = evaluate.load("rouge")
+meteor = evaluate.load("meteor")
 
 
-class CxrCLIPTrainer:
+class CxrDecoderTrainer:
     def __init__(
             self,
             model,
@@ -27,86 +27,78 @@ class CxrCLIPTrainer:
             val_loader=None,
             test_loader=None,
             device='cuda' if torch.cuda.is_available() else 'cpu',
-            output_dir='./output/pretrain',
+            output_dir='./output/generation',
             mixed_precision=False,
     ):
         self.device = device
         self.config = config
-        self.model = model.to(self.device)
         self.loss_fn = loss_fn
-
-        self.class_prompts_embeddings = None
-        self.max_length = self.config.get('max_length', 143)
+        self.model = model.to(device)
 
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
 
-        self.init_lr = float(self.config.get('init_lr', 1e-5))
-        self.min_lr = float(self.config.get('min_lr', 1e-6))
-        self.warmup_lr = float(self.config.get('warmup_lr', 1e-7))
-        self.weight_decay = self.config.get('weight_decay', 0.05)
+        self.max_length = config.get('max_length', 256)
+        self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        self.max_grad_norm = config.get('max_grad_norm', 1.0)
 
-        self.early_stopping_patience = self.config.get('early_stopping_patience', 5)
-        self.warmup_steps = self.config.get('warmup_steps', 1000)
-        self.scheduler_type = self.config.get('scheduler_type', 'cosine')  # 'cosine' or 'cosine_restarts'
-        self.restarts_t_mult = self.config.get('restarts_t_mult', 1)
+        self.init_lr = float(config.get('init_lr', 5e-6))
+        self.min_lr = float(config.get('min_lr', 1e-6))
+        self.warmup_lr = float(config.get('warmup_lr', 1e-7))
+        self.weight_decay = config.get('weight_decay', 0.02)
+        self.warmup_steps = config.get('warmup_steps', 500)
 
-        self.max_grad_norm = self.config.get('max_grad_norm', 1.0)
-        self.gradient_accumulation_steps = self.config.get('gradient_accumulation_steps', 1)
-        self.log_interval = self.config.get('log_interval', 100)
-        self.save_interval = self.config.get('save_interval', 1000)
+        self.log_interval = config.get('log_interval', 10)
+        self.save_interval = config.get('save_interval', 500)
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
         steps_per_epoch = len(train_loader)
-        if self.config.get('max_epochs') is None:
-            self.max_steps = self.config.get('max_steps', 10000)
+        if config.get('max_epochs') is None:
+            self.max_steps = config.get('max_steps', 10000)
             self.num_epochs = (self.max_steps + steps_per_epoch - 1) // steps_per_epoch
         else:
-            self.num_epochs = self.config.get('max_epochs', 10)
+            self.num_epochs = config.get('max_epochs', 10)
             self.max_steps = steps_per_epoch * self.num_epochs
 
-        # visual encoder typically learns slower than other components
+        self.model.train()
+        param_groups = [{'params': [p for n, p in model.named_parameters() if p.requires_grad]}]
         self.optimizer = AdamW(
-            [
-                {'params': [p for n, p in model.named_parameters() if 'image_encoder' in n], 'lr': self.init_lr * 0.1},
-                {'params': [p for n, p in model.named_parameters() if 'image_encoder' not in n]}
-            ],
+            param_groups,
             lr=self.init_lr,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.999)
         )
 
-        # initialize learning rate scheduler
-        if self.scheduler_type == 'cosine':
+        scheduler_type = config.get('scheduler_type', 'cosine')
+        if scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.max_steps - self.warmup_steps,
                 eta_min=self.min_lr
             )
-        elif self.scheduler_type == 'cosine_restarts':
+        elif scheduler_type == 'cosine_restarts':
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer,
                 T_0=self.max_steps - self.warmup_steps,
-                T_mult=self.restarts_t_mult,
+                T_mult=config.get('restarts_t_mult', 1),
                 eta_min=self.min_lr
             )
         else:
-            raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
 
-        # mixed precision training
         self.scaler = GradScaler('cuda') if torch.cuda.is_available() and mixed_precision else None
 
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float('inf')
-        self.best_r_mean = float('inf')
+        self.best_bleu = 0.0
 
         self.logger = LoggerManager.get_logger(__name__)
+        self.early_stopping_patience = self.config.get('early_stopping_patience', 3)
         self.loss_tracker = LossTracker(self.output_dir, early_stopping_patience=self.early_stopping_patience)
 
-        # log model info
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info(f"Total parameters: {total_params:,}")
@@ -119,17 +111,7 @@ class CxrCLIPTrainer:
             param_group['lr'] = lr
 
     def train(self):
-        self.model.train()
-        self.logger.info("Start training")
-
-        if self.class_prompts_embeddings is None and self.val_loader is not None:
-            self.logger.info("Generating class prompts embeddings for zero-shot evaluation")
-            self.class_prompts_embeddings = generate_concept_prompt_embeddings(
-                self.model,
-                self.model.tokenizer,
-                CHEXPERT_LABELS,
-                self.device,
-            )
+        self.logger.info("Starting training")
 
         for epoch in range(self.num_epochs):
             self.epoch = epoch
@@ -166,39 +148,34 @@ class CxrCLIPTrainer:
 
             if self.val_loader is not None:
                 val_metrics = self.evaluate()
-                val_loss = val_metrics['val_loss']
-
-                early_stop = self.loss_tracker.add_validation_loss(val_loss)
-
                 if val_metrics['val_loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['val_loss']
                     self.save_checkpoint(is_best=True, suffix='best_loss')
 
-                if val_metrics['r_mean'] < self.best_r_mean:
-                    self.best_r_mean = val_metrics['r_mean']
-                    self.save_checkpoint(is_best=True, suffix='best_retrieval')
+                if val_metrics.get('bleu', 0) > self.best_bleu:
+                    self.best_bleu = val_metrics.get('bleu', 0)
+                    self.save_checkpoint(is_best=True, suffix='best_bleu')
 
-                if early_stop:
-                    self.logger.info(f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
-                    self.loss_tracker.generate_all_plots()
-                    break
+        self.logger.info("Training completed")
 
         if self.test_loader is not None:
             self.logger.info("Running final evaluation on test set")
             self.evaluate(test=True)
 
-        self.loss_tracker.generate_all_plots()
-        self.logger.info("Training completed")
+        try:
+            self.loss_tracker.generate_all_plots()
+        except Exception as e:
+            self.logger.error(f"Error generating loss plots: {e}")
+        self.logger.info("Training and evaluation completed")
 
     def train_step(self, batch):
-        # apply warmup schedule if in warmup phase
         if self.global_step < self.warmup_steps:
             self.warmup_lr_schedule(self.global_step)
 
         if self.scaler is not None:
             with autocast('cuda'):
                 outputs = self.model(batch, self.device)
-                loss_dict = self.loss_fn(**outputs, is_train=True)
+                loss_dict = self.loss_fn(**outputs)
                 loss = loss_dict['total']
                 scaled_loss = loss / self.gradient_accumulation_steps
 
@@ -216,7 +193,7 @@ class CxrCLIPTrainer:
                     self.scheduler.step()
         else:
             outputs = self.model(batch, self.device)
-            loss_dict = self.loss_fn(**outputs, is_train=True)
+            loss_dict = self.loss_fn(**outputs)
             loss = loss_dict['total']
             scaled_loss = loss / self.gradient_accumulation_steps
 
@@ -235,91 +212,63 @@ class CxrCLIPTrainer:
 
     @torch.no_grad()
     def evaluate(self, test=False):
-        """Evaluate the model on validation or test set"""
         self.model.eval()
+
         dataloader = self.test_loader if test else self.val_loader
         phase = "test" if test else "val"
 
+        references, hypotheses = [], []
         total_loss = 0.0
-        all_texts = []
-        all_labels = []
-        uids = []
-        image_embeddings = []
-        text_embeddings = []
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
-            images = batch['images']
-            texts = batch['texts']
-            tokens = batch['text_tokens']
-            labels = batch['labels']
-
-            if 'uid' in batch:
-                uids.extend(batch['uid'])
+            images = batch['images'].to(self.device)
+            reports = batch['texts']
 
             outputs = self.model(batch, self.device)
             loss_dict = self.loss_fn(**outputs)
             loss = loss_dict['total']
             total_loss += loss
 
-            img_emb = self.model.encode_image(images.to(self.device))
-            img_emb = self.model.image_projection(img_emb) if self.model.projection else img_emb
-            img_emb = img_emb / torch.norm(img_emb, dim=1, keepdim=True)
-            img_emb = img_emb.detach().cpu().numpy()
+            image_embeds = self.model.encode_image(images)
+            image_embeds = self.model.image_proj(image_embeds)
+            image_atts = torch.ones((image_embeds.shape[0], 1), dtype=torch.long).to(self.device)
 
-            text_emb = self.model.encode_text(tokens.to(self.device))
-            text_emb = self.model.text_projection(text_emb) if self.model.projection else text_emb
-            text_emb = text_emb / torch.norm(text_emb, dim=1, keepdim=True)
-            text_emb = text_emb.detach().cpu().numpy()
+            captions = self.model.generate(
+                image_embeds=image_embeds,
+                image_atts=image_atts,
+                findings=batch['labels'],
+                temperature=1.0,
+                repetition_penalty=1.4,
+            )
 
-            image_embeddings.append(img_emb)
-            text_embeddings.append(text_emb)
-            all_texts.extend(texts)
-            all_labels.append(labels.detach().cpu().numpy())
+            references.extend([[r] for r in reports])  # BLEU expects list of lists
+            hypotheses.extend(captions)
 
-        image_embeddings = np.concatenate(image_embeddings)
-        text_embeddings = np.concatenate(text_embeddings)
-        all_labels = np.concatenate(all_labels)
 
-        num_batches = len(dataloader)
-        avg_loss = total_loss / num_batches
-        retrieval_metrics = compute_retrieval_metrics(image_embeddings, text_embeddings, all_texts)
-        classification_metrics = compute_zeroshot_classification_metrics_from_embeddings(
-            image_embeddings,
-            self.class_prompts_embeddings,
-            all_labels,
-            CHEXPERT_LABELS,
-        )
+        bleu_score = bleu.compute(predictions=hypotheses, references=references)
+        rouge_scores = rouge.compute(predictions=hypotheses, references=references)
+        meteor_score = meteor.compute(predictions=hypotheses, references=references)
 
-        eval_metrics = {
-            f"{phase}_loss": avg_loss,
+        metrics = {
+            f"{phase}_loss": total_loss / len(dataloader),
+            "bleu": bleu_score["bleu"],
+            "rouge1": rouge_scores["rouge1"],
+            "rouge2": rouge_scores["rouge2"],
+            "rougeL": rouge_scores["rougeL"],
+            "meteor": meteor_score["meteor"]
         }
-        eval_metrics.update(retrieval_metrics)
 
-        for class_name in CHEXPERT_LABELS:
-            if class_name in classification_metrics:
-                for metric_name, metric_value in classification_metrics[class_name].items():
-                    eval_metrics[f"classification_{class_name}_{metric_name}"] = metric_value
+        self.logger.info(f"{phase.capitalize()} sample:")
+        samples = np.random.randint(0, len(hypotheses), size=3)
+        for i in samples:
+            self.logger.info(f"Reference: {references[i][0]}")
+            self.logger.info(f"Prediction: {hypotheses[i]}")
+        safe_eval_metrics = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in metrics.items()}
+        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(safe_eval_metrics, indent=2)}")
 
-        for k, v in classification_metrics['average'].items():
-            eval_metrics[f"classification_{k}"] = v
-
-        eval_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in eval_metrics.items()}
-        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(eval_metrics, indent=2)}")
-
-        threshold_info = {}
-        for class_name in CHEXPERT_LABELS:
-            if class_name in classification_metrics and 'threshold' in classification_metrics[class_name]:
-                threshold_info[class_name] = classification_metrics[class_name]['threshold']
-
-        if threshold_info:
-            self.logger.info(f"Optimal thresholds: {json.dumps(threshold_info, indent=2)}")
-
-        self.model.train()
-        return eval_metrics
-
+        return metrics
 
     def save_checkpoint(self, step=None, is_best=False, suffix=None):
-        """Save model checkpoint"""
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -327,30 +276,36 @@ class CxrCLIPTrainer:
             'global_step': self.global_step,
             'epoch': self.epoch,
             'best_val_loss': self.best_val_loss,
-            'best_r_mean': self.best_r_mean,
+            'best_bleu': self.best_bleu,
             'config': self.config
         }
 
         if step is not None:
-            checkpoint_path = os.path.join(self.output_dir, f'cxr_clip_checkpoint-{step}.pt')
+            checkpoint_path = os.path.join(self.output_dir, f'cxr_report_decoder-{step}.pt')
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         if is_best:
             if suffix:
-                best_path = os.path.join(self.output_dir, f'cxr_clip_{suffix}.pt')
+                best_path = os.path.join(self.output_dir, f'cxr_report_decoder_{suffix}.pt')
             else:
-                best_path = os.path.join(self.output_dir, 'cxr_clip_best.pt')
+                best_path = os.path.join(self.output_dir, 'cxr_report_decoder_best.pt')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model to {best_path}")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load saved checkpoint"""
+        """Load model checkpoint"""
         if not os.path.exists(checkpoint_path):
             self.logger.warning(f"Checkpoint {checkpoint_path} does not exist. Starting from scratch.")
             return
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model'])
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.global_step = checkpoint['global_step']
+        self.epoch = checkpoint['epoch']
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.best_bleu = checkpoint.get('best_bleu', 0.0)
 
         self.logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {self.epoch}, step {self.global_step})")

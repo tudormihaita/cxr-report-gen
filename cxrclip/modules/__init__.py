@@ -1,7 +1,8 @@
 import os
 from typing import Dict
+from transformers import AutoConfig, AutoModelForCausalLM, BertConfig, BertLMHeadModel
 
-from .image_classifier import LinearClassifier
+from .image_classifier import LinearClassifier, MLPClassifier
 from .image_encoder import VisionTransformerEncoder
 from .projection import LinearProjectionHead, MLPProjectionHead
 from .text_encoder import BertTextEncoder
@@ -46,11 +47,12 @@ def load_text_encoder(config_text_encoder: Dict, vocab_size: int):
 
 
 def load_projection_head(embedding_dim: int, config_projection_head: Dict):
-    if config_projection_head["name"].lower() == "mlp":
+    model_type = config_projection_head["name"].lower()
+    if model_type == "mlp":
         projection_head = MLPProjectionHead(
             embedding_dim=embedding_dim, projection_dim=config_projection_head["proj_dim"], dropout=config_projection_head["dropout"]
         )
-    elif config_projection_head["name"].lower() == "linear":
+    elif model_type == "linear":
         projection_head = LinearProjectionHead(embedding_dim=embedding_dim, projection_dim=config_projection_head["proj_dim"])
     else:
         raise KeyError(f"Not supported text encoder: {config_projection_head}")
@@ -58,9 +60,62 @@ def load_projection_head(embedding_dim: int, config_projection_head: Dict):
 
 
 def load_image_classifier(config_image_classifier: Dict, feature_dim: int):
-    if config_image_classifier["name"].lower() == "linear":
+    model_type = config_image_classifier["name"].lower()
+    if model_type == "linear":
         _image_classifier = LinearClassifier(feature_dim=feature_dim, num_class=config_image_classifier["n_class"])
+    elif model_type == "mlp":
+        _image_classifier = MLPClassifier(feature_dim=feature_dim, hidden_dim=config_image_classifier["hidden_dim"], num_class=config_image_classifier["n_class"])
     else:
         raise KeyError(f"Not supported image classifier: {config_image_classifier}")
 
     return _image_classifier
+
+
+def load_text_decoder(config_text_decoder: Dict, vocab_size: int):
+    if config_text_decoder["source"].lower() == "huggingface":
+        cache_dir = config_text_decoder.get("cache_dir", "~/.cache/huggingface/hub")
+        pretrained = config_text_decoder.get("pretrained", True)
+        decoder_name = config_text_decoder["name"]
+
+        if "bert" in decoder_name.lower():
+            decoder_config = BertConfig.from_pretrained(
+                decoder_name,
+                cache_dir=cache_dir,
+            )
+            decoder_config.is_decoder = True
+            decoder_config.add_cross_attention = True
+
+            if "encoder_width" in config_text_decoder:
+                decoder_config.encoder_width = config_text_decoder["encoder_width"]
+
+            if pretrained:
+                text_decoder = BertLMHeadModel.from_pretrained(
+                    decoder_name,
+                    config=decoder_config,
+                    cache_dir=cache_dir,
+                )
+            else:
+                text_decoder = BertLMHeadModel(config=decoder_config)
+        else:
+            decoder_config = AutoConfig.from_pretrained(
+                decoder_name,
+                cache_dir=cache_dir,
+            )
+            if not getattr(decoder_config, "is_encoder_decoder", False):
+                raise ValueError(f"Model '{decoder_name}' is not an encoder-decoder model.")
+
+            if pretrained:
+                text_decoder = AutoModelForCausalLM.from_pretrained(
+                    decoder_name,
+                    config=decoder_config,
+                    cache_dir=cache_dir,
+                )
+            else:
+                text_decoder = AutoModelForCausalLM.from_config(config=decoder_config)
+
+        text_decoder.resize_token_embeddings(vocab_size)
+    else:
+        raise NotImplementedError(f"Decoder source {config_text_decoder['source']} not supported.")
+
+    return text_decoder
+

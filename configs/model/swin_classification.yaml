@@ -1,5 +1,5 @@
-name: "finetune_classification"
-load_backbone_weights: "./output/cxr_clip_best_retrieval.pt"
+name: "finetune_classifier"
+load_backbone_weights: "./output/cxr_clip_best_loss.pt"
 freeze_backbone_weights: true
 
 image_encoder:
@@ -10,5 +10,6 @@ image_encoder:
 
 classifier:
   config:
-    name: "linear"
+    name: "mlp" # one of { "linear", "mlp" }
+    hidden_dim: 384
     n_class: 14

@@ -11,7 +11,7 @@ train:
     hue: 0.1
   CenterCrop:
     size: 224
-valid:
+val:
   Resize:
     size: 224
   CenterCrop:

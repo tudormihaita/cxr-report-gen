@@ -1,0 +1,22 @@
+name: "downstream_decoder"
+load_backbone_weights: "./output/cxr_clip_best_loss.pt"
+freeze_backbone_weights: true
+
+image_encoder:
+  source: "huggingface"
+  name: 'microsoft/swin-tiny-patch4-window7-224'
+  pretrained: true
+  model_type: 'swin'
+
+text_decoder:
+  source: "huggingface"
+  name: Mbilal755/Radiology_Bart
+  pretrained: true
+  cache_dir: "huggingface/"
+  trust_remote_code: true
+  encoder_width: 768
+
+  max_length: 256
+  min_length: 77
+  beam_size: 5
+  prompt_template: "Chest X-ray showing {}"

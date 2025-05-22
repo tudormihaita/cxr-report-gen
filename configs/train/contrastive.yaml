@@ -1,5 +1,5 @@
 image_size: 224
-max_length: 128
+max_length: 143
 
 batch_size: 32
 init_lr: 1e-5
