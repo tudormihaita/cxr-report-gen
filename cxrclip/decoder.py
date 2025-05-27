@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 
 from typing import Dict, TypeVar
+from transformers.modeling_outputs import BaseModelOutput
+
 from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
 from .modules import load_image_encoder, load_text_decoder
@@ -11,7 +13,7 @@ T = TypeVar("T", bound="Module")
 log = LoggerManager.get_logger(__name__)
 
 
-class CxrCLIPDecoder(nn.Module):
+class CxrReportDecoder(nn.Module):
     def __init__(
             self,
             model_config: Dict,
@@ -21,10 +23,11 @@ class CxrCLIPDecoder(nn.Module):
         super().__init__()
 
         self.tokenizer = tokenizer
-        self.max_length = model_config["text_decoder"]["max_length"]
-        self.min_length = model_config["text_decoder"]["min_length"]
+        self.max_input_length = model_config["text_decoder"]["max_input_length"]
+        self.max_output_length = model_config["text_decoder"]["max_output_length"]
 
         self.prompt_template = model_config["text_decoder"]["prompt_template"]
+        self.instruction_prefix = model_config["text_decoder"].get("instruction_prefix", "")
         self.beam_size = model_config["text_decoder"]["beam_size"]
 
         if model_config["load_backbone_weights"] is None:
@@ -34,7 +37,8 @@ class CxrCLIPDecoder(nn.Module):
             if not os.path.isfile(model_config["load_backbone_weights"]):
                 raise ValueError(f"Cannot find a weight file: {model_config['load_backbone_weights']}")
             ckpt = torch.load(model_config["load_backbone_weights"], map_location="cpu", weights_only=False)
-            model_key = "model_state_dict"
+            # TODO: fix with using only model_state_dict after correcting the training script
+            model_key = "model_state_dict" if use_custom else "model_state_dict"
             self.image_encoder = load_image_encoder(model_config["image_encoder"])
             image_encoder_weights = {}
             for k in ckpt[model_key].keys():
@@ -47,11 +51,13 @@ class CxrCLIPDecoder(nn.Module):
             for param in self.image_encoder.parameters():
                 param.requires_grad = False
 
-        self.text_decoder = load_text_decoder(model_config["text_decoder"], len(tokenizer))
+        self.text_decoder = load_text_decoder(model_config["text_decoder"], len(tokenizer), mode="conditional")
 
-        encoder_hidden_size = model_config["image_encoder"].get("hidden_size", 768)
+        encoder_hidden_size = model_config["image_encoder"]["hidden_size"]
         decoder_hidden_size = self.text_decoder.config.d_model
+
         self.image_proj = nn.Linear(encoder_hidden_size, decoder_hidden_size)
+        self.image_pos_embedding = nn.Parameter(torch.randn(1, 1, decoder_hidden_size) * 0.02)
 
 
     def train(self: T, mode: bool = True) -> T:
@@ -69,17 +75,11 @@ class CxrCLIPDecoder(nn.Module):
 
     def encode_image(self, image):
         image_features = self.image_encoder(image)
-
+        # use [CLS] token as global image descriptor
         global_features = image_features[:, 0]
         return global_features
 
-    def forward(self, batch, device=None):
-        device = batch["images"].device if device is None else device
-        image_embeds = self.encode_image(batch["images"].to(device))
-        image_embeds = self.image_proj(image_embeds)
-        image_atts = torch.ones((image_embeds.shape[0], 1), dtype=torch.long).to(device)
-
-        concept_labels = batch["labels"]
+    def _prepare_encoder_inputs(self, concept_labels):
         prompts = []
         for labels in concept_labels:
             findings = [CHEXPERT_LABELS[i] for i in torch.where(labels == 1)[0].cpu().numpy()]
@@ -87,113 +87,152 @@ class CxrCLIPDecoder(nn.Module):
             prompt = self.prompt_template.format(findings_caption)
             prompts.append(prompt)
 
-
-        gt_texts = [p + " " + t for p, t in zip(prompts, batch["texts"])]
-        text_inputs = self.tokenizer(
-            gt_texts,
-            return_tensors="pt",
-            padding='max_length',
+        encoder_texts = [f"{self.instruction_prefix}{prompt}" for prompt in prompts]
+        tokenized_texts = self.tokenizer(
+            encoder_texts,
+            padding=True,
             truncation=True,
-            max_length=self.max_length
+            max_length=self.max_input_length,
+            return_tensors="pt"
         )
-        input_ids = text_inputs.input_ids.to(device)
-        text_attention_mask = text_inputs.attention_mask.to(device)
+        return tokenized_texts
 
-        labels = input_ids.clone()
-        prompt_lengths = []
-        for prompt in prompts:
-            prompt_tokens = self.tokenizer.encode(
-                prompt,
-                add_special_tokens=False
-            )
-            prompt_lengths.append(len(prompt_tokens))
+    def _prepare_decoder_inputs(self, texts, is_train=False):
+        if not is_train:
+            return None
 
-        for i, prompt_length in enumerate(prompt_lengths):
-            if self.tokenizer.bos_token_id is not None and input_ids[i, 0] == self.tokenizer.bos_token_id:
-                prompt_length += 1
-            labels[i, :prompt_length] = -100
-        labels = labels.masked_fill(input_ids == self.tokenizer.pad_token_id, -100)
+        tokenized_texts = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_output_length,
+            return_tensors="pt"
+        )
+        labels = tokenized_texts["input_ids"].clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+
+        decoder_start_token_id = getattr(self.text_decoder.config, 'decoder_start_token_id',
+                                         self.tokenizer.bos_token_id)
+        if decoder_start_token_id is None:
+            # Fallback to pad_token_id or 0 if no start token is defined
+            decoder_start_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        decoder_input_ids = torch.zeros_like(labels)
+        decoder_input_ids[:, 1:] = labels[:, :-1].clone()
+        decoder_input_ids[:, 0] = decoder_start_token_id
+
+        vocab_size = len(self.tokenizer)
+        decoder_input_ids = torch.clamp(decoder_input_ids, 0, vocab_size - 1)
+
+        return {
+            "decoder_input_ids": decoder_input_ids,
+            "decoder_attention_mask": tokenized_texts["attention_mask"],
+            "labels": labels,
+        }
+
+    def _prepare_decoder_forward(self, encoder_inputs, image_embeds, device):
+        encoder_outputs = self.text_decoder.model.encoder(
+            input_ids=encoder_inputs["input_ids"],
+            attention_mask=encoder_inputs["attention_mask"],
+        )
+
+        image_features = self.image_proj(image_embeds)
+        image_features_expanded = image_features.unsqueeze(1) + self.image_pos_embedding
+
+        combined_encoder_outputs = torch.cat([
+            image_features_expanded,
+            encoder_outputs.last_hidden_state,
+        ], dim=1)
+
+        batch_size = encoder_inputs["attention_mask"].size(0)
+        image_attention_mask = torch.ones(batch_size, 1, device=device, dtype=encoder_inputs["attention_mask"].dtype)
+        combined_attention_mask = torch.cat([
+            image_attention_mask,
+            encoder_inputs["attention_mask"]
+        ], dim=1)
+
+        return combined_encoder_outputs, combined_attention_mask, encoder_outputs
+
+    def forward(self, batch, device=None):
+        device = batch["images"].device if device is None else device
+
+        encoder_inputs = self._prepare_encoder_inputs(batch["labels"])
+        encoder_inputs = {k: v.to(device) for k, v in encoder_inputs.items()}
+
+        decoder_inputs = self._prepare_decoder_inputs(texts=batch["texts"], is_train=True,)
+        decoder_inputs = {k: v.to(device) for k, v in decoder_inputs.items()}
+
+        image_embeds = self.encode_image(batch["images"].to(device))
+        combined_encoder_outputs, combined_attention_mask, encoder_outputs = self._prepare_decoder_forward(
+            encoder_inputs=encoder_inputs,
+            image_embeds=image_embeds,
+            device=device
+        )
 
         outputs = self.text_decoder(
-            input_ids=input_ids,
-            attention_mask=text_attention_mask,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            labels=labels,
-            return_dict=True,
+            encoder_outputs=BaseModelOutput(last_hidden_state=combined_encoder_outputs),
+            attention_mask=combined_attention_mask,
+            decoder_input_ids=decoder_inputs["decoder_input_ids"],
+            decoder_attention_mask=decoder_inputs["decoder_attention_mask"],
+            labels=decoder_inputs["labels"],
         )
 
         return {
             "logits": outputs.logits,
-            "labels": labels
+            "labels": decoder_inputs["labels"],
+            "loss": outputs.loss,
         }
 
-    def generate(self, image_embeds, image_atts, prompt=None, findings=None,
+    def generate(self, image_embeds, findings=None,
                  num_beams=None, top_p=0.9, temperature=1.0, repetition_penalty=1.0,
-                 sample=False
+                 sample=False, device=None
                  ):
+        if findings is None:
+            raise NotImplementedError("Prompt construction is not implemented yet. Please provide findings.")
         if num_beams is None:
             num_beams = self.beam_size
 
-        prompts = []
-        for i in range(image_embeds.size(0)):
-            if findings is not None:
-                pos_labels = (findings[i] == 1).nonzero(as_tuple=False).view(-1).tolist()
-                findings_caption = ', '.join([CHEXPERT_LABELS[j] for j in pos_labels]) if pos_labels else "No Finding"
+        self.text_decoder.eval()
+        with torch.no_grad():
+            encoder_inputs = self._prepare_encoder_inputs(concept_labels=findings)
+            encoder_inputs = {k: v.to(device) for k, v in encoder_inputs.items()}
+
+            combined_encoder_outputs, combined_attention_mask, encoder_outputs = self._prepare_decoder_forward(
+                encoder_inputs=encoder_inputs,
+                image_embeds=image_embeds.to(device),
+                device=device
+            )
+
+            generation_kwargs = {
+                "max_length": self.max_output_length,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "repetition_penalty": repetition_penalty,
+            }
+
+            if sample:
+                generation_kwargs.update({
+                    "do_sample": True,
+                    "top_p": top_p,
+                    "temperature": temperature,
+                    "num_return_sequences": 1,
+                })
             else:
-                findings_caption = ""
+                generation_kwargs.update({
+                    "num_beams": num_beams,
+                    "early_stopping": True,
+                })
 
-            prompt_str = self.prompt_template.format(findings_caption)
-            prompts.append(prompt_str)
-
-        prompt_inputs = self.tokenizer(prompts, return_tensors="pt", padding=True)
-        input_ids = prompt_inputs.input_ids.to(image_embeds.device)
-
-        if hasattr(self.tokenizer, "bos_token_id") and self.tokenizer.bos_token_id is not None:
-            input_ids[:, 0] = self.tokenizer.bos_token_id
-
-        model_kwargs = {
-            "encoder_hidden_states": image_embeds,
-            "encoder_attention_mask": image_atts,
-        }
-
-        if sample:
             outputs = self.text_decoder.generate(
-                input_ids=input_ids,
-                max_length=self.max_length,
-                min_length=self.min_length,
-                do_sample=True,
-                top_p=top_p,
-                temperature=temperature,
-                num_return_sequences=1,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=3,
-                **model_kwargs
-            )
-        else:
-            outputs = self.text_decoder.generate(
-                input_ids=input_ids,
-                max_length=self.max_length,
-                min_length=self.min_length,
-                num_beams=num_beams,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=3,
-                **model_kwargs
+                encoder_outputs=BaseModelOutput(last_hidden_state=combined_encoder_outputs),
+                attention_mask=combined_attention_mask,
+                **generation_kwargs
             )
 
-        captions = []
-        for output in outputs:
-            caption = self.tokenizer.decode(output, skip_special_tokens=True)
-            if prompt and caption.startswith(prompt):
-                caption = caption[len(prompt):].strip()
-            captions.append(caption)
-
-        return captions
-
-
-
-
+            generated_texts = self.tokenizer.batch_decode(
+                outputs,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            generated_texts = [text.strip() for text in generated_texts]
+        return generated_texts

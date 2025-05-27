@@ -2,7 +2,7 @@ from typing import Dict
 
 from .combined_loss import CombinedLoss
 from .classification_loss import ClassificationLoss
-from .contrastive_loss import ImageTextContrastiveLoss
+from .contrastive_loss import SemanticKLContrastiveLoss, ImageTextContrastiveLoss, SemanticMatchingLoss
 from .lm_loss import LanguageModelingLoss
 
 
@@ -15,8 +15,12 @@ def build_loss(all_loss_config: Dict) -> CombinedLoss:
             continue
         if loss_config == "classification":
             loss = ClassificationLoss(**cfg)
-        elif loss_config == "contrastive":
+        elif loss_config == "contrastive_clip":
             loss = ImageTextContrastiveLoss(**cfg)
+        elif loss_config == "contrastive_distribution":
+            loss = SemanticKLContrastiveLoss(**cfg)
+        elif loss_config == "contrastive_semantic":
+            loss = SemanticMatchingLoss(**cfg)
         elif loss_config == "language_modeling":
             loss = LanguageModelingLoss(**cfg)
         else:

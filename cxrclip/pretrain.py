@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import nltk
 import torch
 import numpy as np
 
@@ -12,9 +11,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmResta
 
 from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
-from utils.loss_tracker import LossTracker
+from utils.training_monitor import TrainingMonitor
 from data.metrics import compute_retrieval_metrics, generate_concept_prompt_embeddings, \
-    compute_zeroshot_classification_metrics_from_embeddings
+    compute_zeroshot_classification_metrics_from_embeddings, compute_label_aware_retrieval_metrics
 
 
 class CxrCLIPTrainer:
@@ -104,9 +103,12 @@ class CxrCLIPTrainer:
         self.best_r_mean = float('inf')
 
         self.logger = LoggerManager.get_logger(__name__)
-        self.loss_tracker = LossTracker(self.output_dir, early_stopping_patience=self.early_stopping_patience)
+        self.train_monitor = TrainingMonitor(
+            output_dir=self.output_dir,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_metric='val_loss'
+        )
 
-        # log model info
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info(f"Total parameters: {total_params:,}")
@@ -150,7 +152,7 @@ class CxrCLIPTrainer:
                 epoch_loss += loss
 
                 if (self.global_step + 1) % self.log_interval == 0:
-                    self.loss_tracker.add_training_loss(loss, self.global_step + 1, epoch)
+                    self.train_monitor.log_metric('train_loss', loss, self.global_step + 1)
                     self.logger.info(f"Step {self.global_step + 1}: Loss = {loss:.4f}")
 
                 if (self.global_step + 1) % self.save_interval == 0:
@@ -168,7 +170,7 @@ class CxrCLIPTrainer:
                 val_metrics = self.evaluate()
                 val_loss = val_metrics['val_loss']
 
-                early_stop = self.loss_tracker.add_validation_loss(val_loss)
+                early_stop = self.train_monitor.log_metric('val_loss', val_loss, self.global_step + 1)
 
                 if val_metrics['val_loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['val_loss']
@@ -179,19 +181,25 @@ class CxrCLIPTrainer:
                     self.save_checkpoint(is_best=True, suffix='best_retrieval')
 
                 if early_stop:
-                    self.logger.info(f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
-                    self.loss_tracker.generate_all_plots()
+                    self.logger.info(
+                        f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
+                    try:
+                        self.train_monitor.plot_all_metrics()
+                    except Exception as e:
+                        self.logger.warning(f"Error generating plots: {e}")
                     break
 
         if self.test_loader is not None:
             self.logger.info("Running final evaluation on test set")
             self.evaluate(test=True)
 
-        self.loss_tracker.generate_all_plots()
+        try:
+            self.train_monitor.plot_all_metrics()
+        except Exception as e:
+            self.logger.warning(f"Error generating plots: {e}")
         self.logger.info("Training completed")
 
     def train_step(self, batch):
-        # apply warmup schedule if in warmup phase
         if self.global_step < self.warmup_steps:
             self.warmup_lr_schedule(self.global_step)
 
@@ -241,11 +249,12 @@ class CxrCLIPTrainer:
         phase = "test" if test else "val"
 
         total_loss = 0.0
+        uids = []
         all_texts = []
         all_labels = []
-        uids = []
-        image_embeddings = []
-        text_embeddings = []
+        all_image_embeddings = []
+        all_text_embeddings = []
+        class_prompt_embeddings = self.class_prompts_embeddings
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
             images = batch['images']
@@ -271,21 +280,21 @@ class CxrCLIPTrainer:
             text_emb = text_emb / torch.norm(text_emb, dim=1, keepdim=True)
             text_emb = text_emb.detach().cpu().numpy()
 
-            image_embeddings.append(img_emb)
-            text_embeddings.append(text_emb)
+            all_image_embeddings.append(img_emb)
+            all_text_embeddings.append(text_emb)
             all_texts.extend(texts)
             all_labels.append(labels.detach().cpu().numpy())
 
-        image_embeddings = np.concatenate(image_embeddings)
-        text_embeddings = np.concatenate(text_embeddings)
+        all_image_embeddings = np.concatenate(all_image_embeddings)
+        all_text_embeddings = np.concatenate(all_text_embeddings)
         all_labels = np.concatenate(all_labels)
 
         num_batches = len(dataloader)
         avg_loss = total_loss / num_batches
-        retrieval_metrics = compute_retrieval_metrics(image_embeddings, text_embeddings, all_texts)
+        retrieval_metrics = compute_retrieval_metrics(all_image_embeddings, all_text_embeddings, all_texts)
         classification_metrics = compute_zeroshot_classification_metrics_from_embeddings(
-            image_embeddings,
-            self.class_prompts_embeddings,
+            all_image_embeddings,
+            class_prompt_embeddings,
             all_labels,
             CHEXPERT_LABELS,
         )
@@ -295,11 +304,9 @@ class CxrCLIPTrainer:
         }
         eval_metrics.update(retrieval_metrics)
 
-        for class_name in CHEXPERT_LABELS:
-            if class_name in classification_metrics:
-                for metric_name, metric_value in classification_metrics[class_name].items():
-                    eval_metrics[f"classification_{class_name}_{metric_name}"] = metric_value
-
+        if phase == "val":
+            for k, v in retrieval_metrics.items():
+                self.train_monitor.log_metric(k, v, self.global_step + 1)
         for k, v in classification_metrics['average'].items():
             eval_metrics[f"classification_{k}"] = v
 
@@ -317,7 +324,6 @@ class CxrCLIPTrainer:
         self.model.train()
         return eval_metrics
 
-
     def save_checkpoint(self, step=None, is_best=False, suffix=None):
         """Save model checkpoint"""
         checkpoint = {
@@ -326,21 +332,19 @@ class CxrCLIPTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
             'epoch': self.epoch,
-            'best_val_loss': self.best_val_loss,
-            'best_r_mean': self.best_r_mean,
             'config': self.config
         }
 
         if step is not None:
-            checkpoint_path = os.path.join(self.output_dir, f'cxr_clip_checkpoint-{step}.pt')
+            checkpoint_path = os.path.join(self.output_dir, f'clip-xrgen-pt_ckpt-{step}.pt')
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         if is_best:
             if suffix:
-                best_path = os.path.join(self.output_dir, f'cxr_clip_{suffix}.pt')
+                best_path = os.path.join(self.output_dir, f'clip-xrgen-pt_{suffix}.pt')
             else:
-                best_path = os.path.join(self.output_dir, 'cxr_clip_best.pt')
+                best_path = os.path.join(self.output_dir, 'clip-xrgen-pt_best.pt')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model to {best_path}")
 
@@ -351,6 +355,6 @@ class CxrCLIPTrainer:
             return
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model'])
+        self.model.load_state_dict(checkpoint['model_state_dict'])
 
         self.logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {self.epoch}, step {self.global_step})")

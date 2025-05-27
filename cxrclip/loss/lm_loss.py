@@ -7,8 +7,14 @@ class LanguageModelingLoss(nn.Module):
         self.name = "language_modeling"
         self.ignore_index = ignore_index
         self.loss_ratio = loss_ratio
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
+        self.loss_fn = nn.CrossEntropyLoss(
+            ignore_index=self.ignore_index,
+            reduction="mean"
+        )
 
-    def forward(self, logits, labels, **kwargs):
-        loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-        return loss
+    def forward(self, logits, labels, model_loss=None, **kwargs):
+        if model_loss is not None:
+            return model_loss * self.loss_ratio
+        else:
+            loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+            return loss * self.loss_ratio

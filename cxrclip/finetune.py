@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmResta
 from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
 from data.metrics import compute_multilabel_classification_metrics_from_logits
-from utils.loss_tracker import LossTracker
+from utils.training_monitor import TrainingMonitor
 
 
 class CxrClassifierTrainer:
@@ -99,7 +99,7 @@ class CxrClassifierTrainer:
 
         self.logger = LoggerManager.get_logger(__name__)
         self.early_stopping_patience = self.config.get('early_stopping_patience', 5)
-        self.loss_tracker = LossTracker(self.output_dir, early_stopping_patience=self.early_stopping_patience)
+        self.loss_tracker = TrainingMonitor(self.output_dir, early_stopping_patience=self.early_stopping_patience)
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

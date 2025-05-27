@@ -1,5 +1,5 @@
 name: "downstream_decoder"
-load_backbone_weights: "./output/cxr_clip_best_loss.pt"
+load_backbone_weights: "./output/clip-xrgen-pretrained-encoder.pt"
 freeze_backbone_weights: true
 
 image_encoder:
@@ -7,16 +7,17 @@ image_encoder:
   name: 'microsoft/swin-tiny-patch4-window7-224'
   pretrained: true
   model_type: 'swin'
+  hidden_size: 768
 
 text_decoder:
   source: "huggingface"
-  name: Mbilal755/Radiology_Bart
+  name: facebook/bart-base
   pretrained: true
   cache_dir: "huggingface/"
   trust_remote_code: true
-  encoder_width: 768
 
-  max_length: 256
-  min_length: 77
+  max_input_length: 77
+  max_output_length: 143
   beam_size: 5
-  prompt_template: "Chest X-ray showing {}"
+  instruction_prefix: "Indication: "
+  prompt_template: "Chest X-ray showing {}. Findings: "

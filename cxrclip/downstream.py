@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from utils.logger import LoggerManager
-from utils.loss_tracker import LossTracker
+from utils.training_monitor import TrainingMonitor
 
 bleu = evaluate.load("bleu")
 rouge = evaluate.load("rouge")
@@ -88,7 +88,7 @@ class CxrDecoderTrainer:
         else:
             raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
 
-        self.scaler = GradScaler('cuda') if torch.cuda.is_available() and mixed_precision else None
+        self.scaler = GradScaler('cuda', init_scale=0.2) if torch.cuda.is_available() and mixed_precision else None
 
         self.global_step = 0
         self.epoch = 0
@@ -97,7 +97,11 @@ class CxrDecoderTrainer:
 
         self.logger = LoggerManager.get_logger(__name__)
         self.early_stopping_patience = self.config.get('early_stopping_patience', 3)
-        self.loss_tracker = LossTracker(self.output_dir, early_stopping_patience=self.early_stopping_patience)
+        self.train_monitor = TrainingMonitor(
+            self.output_dir,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_metric='val_loss'
+        )
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -132,7 +136,7 @@ class CxrDecoderTrainer:
                 epoch_loss += loss
 
                 if (self.global_step + 1) % self.log_interval == 0:
-                    self.loss_tracker.add_training_loss(loss, self.global_step + 1, epoch)
+                    self.train_monitor.log_metric('train_loss', loss, self.global_step + 1)
                     self.logger.info(f"Step {self.global_step + 1}: Loss = {loss:.4f}")
 
                 if (self.global_step + 1) % self.save_interval == 0:
@@ -148,6 +152,10 @@ class CxrDecoderTrainer:
 
             if self.val_loader is not None:
                 val_metrics = self.evaluate()
+                val_loss = val_metrics['val_loss']
+
+                early_stop = self.train_monitor.log_metric('val_loss', val_loss, self.global_step + 1)
+
                 if val_metrics['val_loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['val_loss']
                     self.save_checkpoint(is_best=True, suffix='best_loss')
@@ -156,6 +164,15 @@ class CxrDecoderTrainer:
                     self.best_bleu = val_metrics.get('bleu', 0)
                     self.save_checkpoint(is_best=True, suffix='best_bleu')
 
+                if early_stop:
+                    self.logger.info(
+                        f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
+                    try:
+                        self.train_monitor.plot_all_metrics()
+                    except Exception as e:
+                        self.logger.warning(f"Error generating plots: {e}")
+                    break
+
         self.logger.info("Training completed")
 
         if self.test_loader is not None:
@@ -163,7 +180,7 @@ class CxrDecoderTrainer:
             self.evaluate(test=True)
 
         try:
-            self.loss_tracker.generate_all_plots()
+            self.train_monitor.plot_all_metrics()
         except Exception as e:
             self.logger.error(f"Error generating loss plots: {e}")
         self.logger.info("Training and evaluation completed")
@@ -231,39 +248,46 @@ class CxrDecoderTrainer:
 
             image_embeds = self.model.encode_image(images)
             image_embeds = self.model.image_proj(image_embeds)
-            image_atts = torch.ones((image_embeds.shape[0], 1), dtype=torch.long).to(self.device)
 
             captions = self.model.generate(
                 image_embeds=image_embeds,
-                image_atts=image_atts,
                 findings=batch['labels'],
                 temperature=1.0,
                 repetition_penalty=1.4,
+                device=self.device,
             )
 
             references.extend([[r] for r in reports])  # BLEU expects list of lists
             hypotheses.extend(captions)
 
+        if phase == "test":
+            bleu_score = bleu.compute(predictions=hypotheses, references=references)
+            rouge_scores = rouge.compute(predictions=hypotheses, references=references)
+            meteor_score = meteor.compute(predictions=hypotheses, references=references)
 
-        bleu_score = bleu.compute(predictions=hypotheses, references=references)
-        rouge_scores = rouge.compute(predictions=hypotheses, references=references)
-        meteor_score = meteor.compute(predictions=hypotheses, references=references)
-
-        metrics = {
-            f"{phase}_loss": total_loss / len(dataloader),
-            "bleu": bleu_score["bleu"],
-            "rouge1": rouge_scores["rouge1"],
-            "rouge2": rouge_scores["rouge2"],
-            "rougeL": rouge_scores["rougeL"],
-            "meteor": meteor_score["meteor"]
-        }
+            metrics = {
+                f"{phase}_loss": total_loss / len(dataloader),
+                "bleu": bleu_score["bleu"],
+                "rouge1": rouge_scores["rouge1"],
+                "rouge2": rouge_scores["rouge2"],
+                "rougeL": rouge_scores["rougeL"],
+                "meteor": meteor_score["meteor"]
+            }
+        else:
+            metrics = {
+                f"{phase}_loss": total_loss / len(dataloader),
+            }
 
         self.logger.info(f"{phase.capitalize()} sample:")
         samples = np.random.randint(0, len(hypotheses), size=3)
         for i in samples:
             self.logger.info(f"Reference: {references[i][0]}")
+            self.logger.info("-" * 50)
             self.logger.info(f"Prediction: {hypotheses[i]}")
-        safe_eval_metrics = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in metrics.items()}
+        safe_eval_metrics = {
+            k: (v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v)
+            for k, v in metrics.items()
+        }
         self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(safe_eval_metrics, indent=2)}")
 
         return metrics
@@ -275,21 +299,19 @@ class CxrDecoderTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
             'epoch': self.epoch,
-            'best_val_loss': self.best_val_loss,
-            'best_bleu': self.best_bleu,
             'config': self.config
         }
 
         if step is not None:
-            checkpoint_path = os.path.join(self.output_dir, f'cxr_report_decoder-{step}.pt')
+            checkpoint_path = os.path.join(self.output_dir, f'clip-xrgen-{step}.pt')
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         if is_best:
             if suffix:
-                best_path = os.path.join(self.output_dir, f'cxr_report_decoder_{suffix}.pt')
+                best_path = os.path.join(self.output_dir, f'clip-xrgen_{suffix}.pt')
             else:
-                best_path = os.path.join(self.output_dir, 'cxr_report_decoder_best.pt')
+                best_path = os.path.join(self.output_dir, 'clip-xrgen_best.pt')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model to {best_path}")
 

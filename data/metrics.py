@@ -57,6 +57,67 @@ def compute_retrieval_metrics(image_embeddings, text_embeddings, text_list):
     }
     return eval_metrics
 
+def compute_label_aware_retrieval_metrics(
+        image_embeddings,
+        text_embeddings,
+        labels,
+        threshold=0.5
+):
+    """
+    Compute label-aware retrieval metrics that consider semantic similarity based on medical labels.
+    :param image_embeddings: list of all image embeddings
+    :param text_embeddings: list of all text embeddings
+    :param labels: list of all labels (binary) for the images
+    :param threshold: threshold for Jaccard similarity to consider a match
+    :return: dictionary with label-aware recall@1, recall@5, recall@10 and mean rank
+    """
+    def jaccard_similarity(a, b):
+        intersection = np.logical_and(a, b).sum()
+        union = np.logical_or(a, b).sum()
+        return intersection / (union + 1e-8)
+
+    num_samples = image_embeddings.shape[0]
+    embedding_similarities = metrics.pairwise.cosine_similarity(image_embeddings, text_embeddings)
+    label_similarities = np.zeros((num_samples, num_samples))
+
+    for i in range(num_samples):
+        for j in range(num_samples):
+            label_similarities[i, j] = jaccard_similarity(labels[i], labels[j])
+
+    k_values = [1, 5, 10]
+    recall_dict = {k: 0 for k in k_values}
+    mean_rank = 0
+
+    for idx in range(num_samples):
+        combined_similarity = 0.7 * embedding_similarities[idx] + 0.3 * label_similarities[idx]
+        combined_similarity[idx] = -1
+
+        ranked_indices = np.argsort(-combined_similarity)
+        relevant_ranks = []
+        for rank, candidate_idx in enumerate(ranked_indices):
+            if label_similarities[idx, candidate_idx] >= threshold:
+                relevant_ranks.append(rank + 1)  # +1 for 1-based rank
+
+        if not relevant_ranks:
+            first_relevant_rank = num_samples
+        else:
+            first_relevant_rank = min(relevant_ranks)
+
+        mean_rank += first_relevant_rank
+
+        for k in k_values:
+            top_k_indices = ranked_indices[:k]
+            if any(label_similarities[idx, i] >= threshold for i in top_k_indices):
+                recall_dict[k] += 1
+
+    eval_metrics = {
+        'label_aware_mean_rank': mean_rank / num_samples,
+    }
+    for k in k_values:
+        eval_metrics[f'label_aware_recall@{k}'] = (recall_dict[k] / num_samples) * 100
+
+    return eval_metrics
+
 
 def compute_zeroshot_classification_metrics_from_embeddings(
         image_embeddings,

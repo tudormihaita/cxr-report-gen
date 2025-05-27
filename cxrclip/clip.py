@@ -87,7 +87,7 @@ class CxrCLIP(nn.Module):
         text_features_g2 = self.encode_text(batch["text_tokens2"].to(device))
         text_embeddings2 = self.text_projection(text_features_g2) if self.projection else text_features_g
         text_embeddings2 = text_embeddings2 / text_embeddings2.norm(dim=1, keepdim=True)
-        out["text_embeddings2"] = text_embeddings2
+        out["text_aug_embeddings"] = text_embeddings2
 
         image_view_encode = self.encode_image(batch["image_views"].to(device))
         image_view_embeddings = self.image_projection(image_view_encode) if self.projection else image_view_encode
