@@ -27,6 +27,13 @@ class XRGenModel(nn.Module):
         special_tokens_dict = { 'additional_special_tokens': ['<findings>'] }
         self.tokenizer.add_special_tokens(special_tokens_dict)
 
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                self.tokenizer.pad_token = '[PAD]'
+
         self.max_seq_length = model_config["text_decoder"]["max_seq_length"]
         self.prompt_template = model_config["text_decoder"]["prompt_template"]
         self.instruction_prefix = model_config["text_decoder"].get("instruction_prefix", "")
