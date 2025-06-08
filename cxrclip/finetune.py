@@ -11,8 +11,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmResta
 
 from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
-from data.metrics import compute_multilabel_classification_metrics_from_logits
 from utils.training_monitor import TrainingMonitor
+from eval.metrics.classification import compute_supervised_classification_metrics
 
 
 class CxrClassifierTrainer:
@@ -73,17 +73,16 @@ class CxrClassifierTrainer:
             betas=(0.9, 0.999)
         )
 
-        # initialize learning rate scheduler
         if self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
-                T_max=self.max_steps - self.warmup_steps,
+                T_max=self.max_steps,
                 eta_min=self.min_lr
             )
         elif self.scheduler_type == 'cosine_restarts':
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer,
-                T_0=self.max_steps - self.warmup_steps,
+                T_0=self.max_steps,
                 T_mult=self.restarts_t_mult,
                 eta_min=self.min_lr
             )
@@ -99,7 +98,7 @@ class CxrClassifierTrainer:
 
         self.logger = LoggerManager.get_logger(__name__)
         self.early_stopping_patience = self.config.get('early_stopping_patience', 5)
-        self.loss_tracker = TrainingMonitor(self.output_dir, early_stopping_patience=self.early_stopping_patience)
+        self.train_monitor = TrainingMonitor(self.output_dir, early_stopping_patience=self.early_stopping_patience)
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -107,7 +106,6 @@ class CxrClassifierTrainer:
         self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%})")
 
     def warmup_lr_schedule(self, step):
-        """Linear warmup of learning rate"""
         lr = self.warmup_lr + (self.init_lr - self.warmup_lr) * step / self.warmup_steps
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
@@ -134,7 +132,7 @@ class CxrClassifierTrainer:
                 epoch_loss += loss
 
                 if (self.global_step + 1) % self.log_interval == 0:
-                    self.loss_tracker.add_training_loss(loss, self.global_step + 1, epoch)
+                    self.train_monitor.log_metric('train_loss', loss, self.global_step + 1)
                     self.logger.info(f"Step {self.global_step + 1}: Loss = {loss:.4f}")
 
                 if (self.global_step + 1) % self.save_interval == 0:
@@ -160,10 +158,13 @@ class CxrClassifierTrainer:
                     self.best_auroc = val_metrics['auroc_avg']
                     self.save_checkpoint(is_best=True, suffix='best_auroc')
 
-                early_stop = self.loss_tracker.add_validation_loss(val_loss.item())
+                self.train_monitor.log_metric('accuracy', val_metrics['accuracy_avg'], self.global_step + 1)
+                self.train_monitor.log_metric('auroc_avg', val_metrics['auroc_avg'], self.global_step + 1)
+
+                early_stop = self.train_monitor.log_metric('val_loss', val_loss, self.global_step + 1)
                 if early_stop:
                     self.logger.info(f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
-                    self.loss_tracker.generate_all_plots()
+                    self.train_monitor.plot_all_metrics()
                     break
 
         if self.test_loader is not None:
@@ -171,7 +172,7 @@ class CxrClassifierTrainer:
             self.evaluate(test=True)
 
         try:
-            self.loss_tracker.generate_all_plots()
+            self.train_monitor.plot_all_metrics()
         except Exception as e:
             self.logger.warning(f"Failed to generate loss plots: {e}")
         self.logger.info("Training completed")
@@ -231,7 +232,7 @@ class CxrClassifierTrainer:
             outputs = self.model(batch, self.device)
             loss_dict = self.loss_fn(**outputs)
             loss = loss_dict['total']
-            total_loss += loss
+            total_loss += loss.item()
 
             predictions = torch.sigmoid(outputs["cls_pred"]).detach().cpu().numpy()
             labels = outputs["target_class"].detach().cpu().numpy()
@@ -242,7 +243,7 @@ class CxrClassifierTrainer:
         all_predictions = np.concatenate(all_predictions, axis=0)
         all_labels = np.concatenate(all_labels, axis=0)
 
-        class_metrics = compute_multilabel_classification_metrics_from_logits(
+        class_metrics = compute_supervised_classification_metrics(
             predictions=all_predictions,
             labels=all_labels,
             class_list=self.class_list
@@ -256,60 +257,49 @@ class CxrClassifierTrainer:
         for k, v in class_metrics['average'].items():
             eval_metrics[k] = v
 
-        for class_name in self.class_list:
-            for metric_name, metric_value in class_metrics[class_name].items():
-                eval_metrics[f"{phase}_{class_name}_{metric_name}"] = metric_value
+        # for class_name in self.class_list:
+        #     for metric_name, metric_value in class_metrics[class_name].items():
+        #         eval_metrics[f"{phase}_{class_name}_{metric_name}"] = metric_value
 
-        optimal_thresholds = {
-            class_name: float(class_metrics[class_name]['optimal_threshold'])
-            for class_name in self.class_list
-        }
 
         safe_eval_metrics = {k: (v.item() if isinstance(v, (torch.Tensor, np.generic)) else v) for k, v in eval_metrics.items()}
         self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(safe_eval_metrics, indent=2)}")
-        self.logger.info(f"Optimal thresholds: {json.dumps(optimal_thresholds, indent=2)}")
         self.model.train()
         return eval_metrics
 
     def save_checkpoint(self, step=None, is_best=False, suffix=None):
-        """Save model checkpoint"""
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
             'epoch': self.epoch,
-            'best_val_loss': self.best_val_loss,
-            'best_auroc': self.best_auroc,
             'config': self.config
         }
 
         if step is not None:
-            checkpoint_path = os.path.join(self.output_dir, f'classifier_checkpoint-{step}.tar')
+            checkpoint_path = os.path.join(self.output_dir, f'clip-xrgen_classifier-ckpt-{step}.tar')
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         if is_best:
             if suffix:
-                best_path = os.path.join(self.output_dir, f'classifier_{suffix}.tar')
+                best_path = os.path.join(self.output_dir, f'clip-xrgen-classifier_{suffix}.tar')
             else:
-                best_path = os.path.join(self.output_dir, 'classifier_best.tar')
+                best_path = os.path.join(self.output_dir, 'clip-xrgen-classifier_best.tar')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model to {best_path}")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load saved checkpoint"""
         if not os.path.exists(checkpoint_path):
             self.logger.warning(f"Checkpoint {checkpoint_path} does not exist. Starting from scratch.")
             return
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.global_step = checkpoint['global_step']
         self.epoch = checkpoint['epoch']
-        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        self.best_auroc = checkpoint.get('best_auroc', 0.0)
 
         self.logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {self.epoch}, step {self.global_step})")

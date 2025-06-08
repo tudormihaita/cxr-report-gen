@@ -1,0 +1,3 @@
+source: "huggingface"
+pretrained_model_name_or_path: "microsoft/BiomedVLP-CXR-BERT-specialized"
+cache_dir: "huggingface/tokenizers"

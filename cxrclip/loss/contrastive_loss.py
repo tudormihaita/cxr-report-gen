@@ -75,9 +75,71 @@ class ImageTextContrastiveLoss(nn.Module):
         return logits_per_image, logits_per_text
 
 
-class SemanticKLContrastiveLoss(nn.Module):
+class SemanticContrastiveAlignmentLoss(nn.Module):
+    def __init__(self, semantic_temperature=1.0, semantic_weight=0.7, loss_ratio=1.0):
+        super(SemanticContrastiveAlignmentLoss, self).__init__()
+        self.name = "contrastive_semantic"
+        self.semantic_temperature = semantic_temperature
+        self.semantic_weight = semantic_weight
+        self.loss_ratio = loss_ratio
+
+    def forward(self,
+                image_embeddings, text_embeddings,
+                image_view_embeddings, text_aug_embeddings,
+                logit_scale, concept_labels,
+                is_train=True, **kwargs
+                ):
+        device = image_embeddings.device
+        label_sim = self._jaccard_sim(concept_labels).to(device)
+        label_sim.fill_diagonal_(0.0)  # prevent self-matching
+
+        total_loss = 0.0
+        # I1 - T1
+        total_loss += self._soft_clip_loss(image_embeddings, text_embeddings, label_sim, logit_scale)
+        # I2 - T1
+        total_loss += self._soft_clip_loss(image_view_embeddings, text_embeddings, label_sim, logit_scale)
+        # I1 - T2
+        total_loss += self._soft_clip_loss(text_embeddings, text_aug_embeddings, label_sim, logit_scale)
+        # I2 - T2
+        total_loss += self._soft_clip_loss(image_view_embeddings, text_aug_embeddings, label_sim, logit_scale)
+
+        total_loss = total_loss / 4.0
+        total_loss = total_loss * self.loss_ratio
+        return total_loss.mean()
+
+    def _soft_clip_loss(self, img_embed, text_embed, label_sim, logit_scale):
+        batch_size = img_embed.shape[0]
+        device = img_embed.device
+        logits = logit_scale * torch.matmul(img_embed, text_embed.T)
+
+        exact_targets = torch.eye(batch_size, device=device)
+        semantic_targets = F.softmax(label_sim * self.semantic_temperature, dim=1)
+        soft_targets = exact_targets + (semantic_targets * self.semantic_weight)
+        soft_targets = F.normalize(soft_targets, p=1, dim=-1)
+
+        loss_i2t = self._soft_xent_loss(logits, soft_targets)
+        loss_t2i = self._soft_xent_loss(logits.T, soft_targets.T)
+        return (loss_i2t + loss_t2i) / 2.0
+
+    def _soft_xent_loss(self, inputs, targets):
+        logprobs = F.log_softmax(inputs, dim=1)
+        return -(targets * logprobs).sum() / inputs.shape[0]
+
+    def _jaccard_sim(self, labels):
+        binary_labels = torch.clamp(labels, min=0).float()
+
+        intersection = torch.matmul(binary_labels, binary_labels.T)
+        sum_labels = binary_labels.sum(dim=1, keepdim=True)
+        union = sum_labels + sum_labels.T - intersection
+
+        jaccard_sim = intersection / (union + 1e-8)
+
+        return jaccard_sim
+
+
+class SemanticDistributionAlignmentLoss(nn.Module):
     def __init__(self, loss_ratio=1.0):
-        super(SemanticKLContrastiveLoss, self).__init__()
+        super(SemanticDistributionAlignmentLoss, self).__init__()
         self.name = "contrastive_distribution"
         self.loss_ratio = loss_ratio
 
@@ -130,68 +192,6 @@ class SemanticKLContrastiveLoss(nn.Module):
         loss_t2i = F.kl_div(log_probs_t2i, soft_targets, reduction='batchmean')
 
         return loss_i2t, loss_t2i
-
-    def _jaccard_sim(self, labels):
-        binary_labels = torch.clamp(labels, min=0).float()
-
-        intersection = torch.matmul(binary_labels, binary_labels.T)
-        sum_labels = binary_labels.sum(dim=1, keepdim=True)
-        union = sum_labels + sum_labels.T - intersection
-
-        jaccard_sim = intersection / (union + 1e-8)
-
-        return jaccard_sim
-
-
-class SemanticMatchingLoss(nn.Module):
-    def __init__(self, semantic_temperature=1.0, semantic_weight=0.7, loss_ratio=1.0):
-        super(SemanticMatchingLoss, self).__init__()
-        self.name = "contrastive_semantic"
-        self.semantic_temperature = semantic_temperature
-        self.semantic_weight = semantic_weight
-        self.loss_ratio = loss_ratio
-
-    def forward(self,
-                image_embeddings, text_embeddings,
-                image_view_embeddings, text_aug_embeddings,
-                logit_scale, concept_labels,
-                is_train=True, **kwargs
-                ):
-        device = image_embeddings.device
-        label_sim = self._jaccard_sim(concept_labels).to(device)
-        label_sim.fill_diagonal_(0.0)  # prevent self-matching
-
-        total_loss = 0.0
-        # I1 - T1
-        total_loss += self._soft_clip_loss(image_embeddings, text_embeddings, label_sim, logit_scale)
-        # I2 - T1
-        total_loss += self._soft_clip_loss(image_view_embeddings, text_embeddings, label_sim, logit_scale)
-        # I1 - T2
-        total_loss += self._soft_clip_loss(text_embeddings, text_aug_embeddings, label_sim, logit_scale)
-        # I2 - T2
-        total_loss += self._soft_clip_loss(image_view_embeddings, text_aug_embeddings, label_sim, logit_scale)
-
-        total_loss = total_loss / 4.0
-        total_loss = total_loss * self.loss_ratio
-        return total_loss.mean()
-
-    def _soft_clip_loss(self, img_embed, text_embed, label_sim, logit_scale):
-        batch_size = img_embed.shape[0]
-        device = img_embed.device
-        logits = logit_scale * torch.matmul(img_embed, text_embed.T)
-
-        exact_targets = torch.eye(batch_size, device=device)
-        semantic_targets = F.softmax(label_sim * self.semantic_temperature, dim=1)
-        fused_targets = exact_targets + (semantic_targets * self.semantic_weight)
-        fused_targets = F.normalize(fused_targets, p=1, dim=-1)
-
-        loss_i2t = self._soft_xent_loss(logits, fused_targets)
-        loss_t2i = self._soft_xent_loss(logits.T, fused_targets.T)
-        return (loss_i2t + loss_t2i) / 2.0
-
-    def _soft_xent_loss(self, inputs, targets):
-        logprobs = F.log_softmax(inputs, dim=1)
-        return -(targets * logprobs).sum() / inputs.shape[0]
 
     def _jaccard_sim(self, labels):
         binary_labels = torch.clamp(labels, min=0).float()

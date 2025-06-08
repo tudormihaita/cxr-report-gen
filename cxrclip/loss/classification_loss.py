@@ -9,6 +9,5 @@ class ClassificationLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, cls_pred, target_class, **kwargs):
-        target_class[target_class < 0] = 0
         loss = self.bce(cls_pred, target_class)
         return loss

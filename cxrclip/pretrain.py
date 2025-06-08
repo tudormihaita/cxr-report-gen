@@ -9,11 +9,9 @@ from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 
-from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
 from utils.training_monitor import TrainingMonitor
-from data.metrics import compute_retrieval_metrics, generate_concept_prompt_embeddings, \
-    compute_zeroshot_classification_metrics_from_embeddings, compute_label_aware_retrieval_metrics
+from eval.metrics.retrieval import compute_retrieval_recall_metrics
 
 
 class CxrCLIPTrainer:
@@ -34,7 +32,6 @@ class CxrCLIPTrainer:
         self.model = model.to(self.device)
         self.loss_fn = loss_fn
 
-        self.class_prompts_embeddings = None
         self.max_length = self.config.get('max_length', 143)
 
         self.train_loader = train_loader
@@ -48,7 +45,7 @@ class CxrCLIPTrainer:
 
         self.early_stopping_patience = self.config.get('early_stopping_patience', 5)
         self.warmup_steps = self.config.get('warmup_steps', 1000)
-        self.scheduler_type = self.config.get('scheduler_type', 'cosine')  # 'cosine' or 'cosine_restarts'
+        self.scheduler_type = self.config.get('scheduler_type', 'cosine')
         self.restarts_t_mult = self.config.get('restarts_t_mult', 1)
 
         self.max_grad_norm = self.config.get('max_grad_norm', 1.0)
@@ -81,20 +78,19 @@ class CxrCLIPTrainer:
         if self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
-                T_max=self.max_steps - self.warmup_steps,
+                T_max=self.max_steps,
                 eta_min=self.min_lr
             )
         elif self.scheduler_type == 'cosine_restarts':
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer,
-                T_0=self.max_steps - self.warmup_steps,
+                T_0=self.max_steps,
                 T_mult=self.restarts_t_mult,
                 eta_min=self.min_lr
             )
         else:
             raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
 
-        # mixed precision training
         self.scaler = GradScaler('cuda') if torch.cuda.is_available() and mixed_precision else None
 
         self.global_step = 0
@@ -115,7 +111,6 @@ class CxrCLIPTrainer:
         self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%})")
 
     def warmup_lr_schedule(self, step):
-        """Linear warmup of learning rate"""
         lr = self.warmup_lr + (self.init_lr - self.warmup_lr) * step / self.warmup_steps
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
@@ -123,15 +118,6 @@ class CxrCLIPTrainer:
     def train(self):
         self.model.train()
         self.logger.info("Start training")
-
-        if self.class_prompts_embeddings is None and self.val_loader is not None:
-            self.logger.info("Generating class prompts embeddings for zero-shot evaluation")
-            self.class_prompts_embeddings = generate_concept_prompt_embeddings(
-                self.model,
-                self.model.tokenizer,
-                CHEXPERT_LABELS,
-                self.device,
-            )
 
         for epoch in range(self.num_epochs):
             self.epoch = epoch
@@ -243,7 +229,6 @@ class CxrCLIPTrainer:
 
     @torch.no_grad()
     def evaluate(self, test=False):
-        """Evaluate the model on validation or test set"""
         self.model.eval()
         dataloader = self.test_loader if test else self.val_loader
         phase = "test" if test else "val"
@@ -254,7 +239,6 @@ class CxrCLIPTrainer:
         all_labels = []
         all_image_embeddings = []
         all_text_embeddings = []
-        class_prompt_embeddings = self.class_prompts_embeddings
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
             images = batch['images']
@@ -287,45 +271,27 @@ class CxrCLIPTrainer:
 
         all_image_embeddings = np.concatenate(all_image_embeddings)
         all_text_embeddings = np.concatenate(all_text_embeddings)
-        all_labels = np.concatenate(all_labels)
 
         num_batches = len(dataloader)
         avg_loss = total_loss / num_batches
-        retrieval_metrics = compute_retrieval_metrics(all_image_embeddings, all_text_embeddings, all_texts)
-        classification_metrics = compute_zeroshot_classification_metrics_from_embeddings(
-            all_image_embeddings,
-            class_prompt_embeddings,
-            all_labels,
-            CHEXPERT_LABELS,
-        )
+        retrieval_metrics = compute_retrieval_recall_metrics(all_image_embeddings, all_text_embeddings, all_texts)
 
         eval_metrics = {
             f"{phase}_loss": avg_loss,
         }
         eval_metrics.update(retrieval_metrics)
 
-        if phase == "val":
+        if not test:
             for k, v in retrieval_metrics.items():
                 self.train_monitor.log_metric(k, v, self.global_step + 1)
-        for k, v in classification_metrics['average'].items():
-            eval_metrics[f"classification_{k}"] = v
 
         eval_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in eval_metrics.items()}
         self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(eval_metrics, indent=2)}")
-
-        threshold_info = {}
-        for class_name in CHEXPERT_LABELS:
-            if class_name in classification_metrics and 'threshold' in classification_metrics[class_name]:
-                threshold_info[class_name] = classification_metrics[class_name]['threshold']
-
-        if threshold_info:
-            self.logger.info(f"Optimal thresholds: {json.dumps(threshold_info, indent=2)}")
 
         self.model.train()
         return eval_metrics
 
     def save_checkpoint(self, step=None, is_best=False, suffix=None):
-        """Save model checkpoint"""
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -349,7 +315,6 @@ class CxrCLIPTrainer:
             self.logger.info(f"Saved best model to {best_path}")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load saved checkpoint"""
         if not os.path.exists(checkpoint_path):
             self.logger.warning(f"Checkpoint {checkpoint_path} does not exist. Starting from scratch.")
             return

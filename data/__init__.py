@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import numpy as np
 import albumentations
@@ -9,9 +10,19 @@ from torchvision import transforms
 from collections import defaultdict
 from typing import Union, Dict
 from transformers import AutoTokenizer
-from torch.utils.data import WeightedRandomSampler
-
 from constants import CHEXPERT_LABELS
+
+
+def load_prompts_from_json(prompt_file_path: str, class_name: str):
+    with open(prompt_file_path, 'r') as f:
+        all_prompts = json.load(f)
+
+    if class_name not in all_prompts:
+        return [], []
+
+    pos_prompts = all_prompts[class_name].get("pos", [])
+    neg_prompts = all_prompts[class_name].get("neg", [])
+    return pos_prompts, neg_prompts
 
 
 def load_tokenizer(pretrained_model_name_or_path, cache_dir, **kwargs):
@@ -24,6 +35,18 @@ def load_tokenizer(pretrained_model_name_or_path, cache_dir, **kwargs):
     )
     if tokenizer.bos_token_id is None:
         tokenizer.bos_token_id = tokenizer.cls_token_id
+
+    if tokenizer.eos_token_id is None:
+        if tokenizer.sep_token_id is not None:
+            tokenizer.eos_token_id = tokenizer.sep_token_id
+        else:
+            tokenizer.add_special_tokens({'eos_token': '[EOS]'})
+
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
     return tokenizer
 
@@ -49,6 +72,12 @@ def load_transform(split: str = "train", transform_config: Dict = None):
 
 
 def transform_image(image_transforms, image: Union[Image.Image, np.ndarray]):
+    if not image_transforms:
+        if not isinstance(image, torch.Tensor):
+            image = transforms.ToTensor()(image)
+        image = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)(image)
+        return image
+
     for tr in image_transforms:
         if isinstance(tr, albumentations.BasicTransform):
             image = np.array(image) if not isinstance(image, np.ndarray) else image
@@ -61,10 +90,9 @@ def transform_image(image_transforms, image: Union[Image.Image, np.ndarray]):
             image = transforms.ToPILImage()(image) if not isinstance(image, Image.Image) else image
             image = tr(image)
 
-        if not isinstance(image, torch.Tensor):
-            image = transforms.ToTensor()(image)
-        image = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)(image)
-
+    if not isinstance(image, torch.Tensor):
+        image = transforms.ToTensor()(image)
+    image = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)(image)
     return image
 
 
@@ -106,17 +134,3 @@ def build_image_text_similarity_mappings(texts, uids):
         img2txt[uid] = matching_uids
 
     return img2txt
-
-
-def build_weighted_sampler(split_df, label_columns=CHEXPERT_LABELS):
-    """
-    Create a weighted sampler for a medical dataset based on the labels.
-    :param split_df: the split of the dataset (train, val, test)
-    :param label_columns: list of columns containing the labels
-    :return: WeightedRandomSampler
-    """
-    labels_array = split_df[label_columns].replace(-1, 0).values
-    label_freq = np.sum(labels_array, axis=0)
-    inverse_freq = 1.0 / label_freq
-    sample_weights = np.max(labels_array * inverse_freq, axis=1)
-    return WeightedRandomSampler(torch.DoubleTensor(sample_weights), num_samples=len(split_df), replacement=True)
