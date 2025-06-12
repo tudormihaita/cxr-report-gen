@@ -23,7 +23,7 @@ from constants import BLIP_SPECIALIZED_BERT_TYPE, BLIP_BASE_VIT
 
 class BLIP(nn.Module):
     def __init__(self,
-                 config='../configs/bert.json',
+                 config='../configs/baselines/bert.json',
                  image_size=224,
                  vit='base',
                  vit_grad_ckpt=False,

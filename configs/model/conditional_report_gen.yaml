@@ -24,7 +24,7 @@ text_decoder:
 prompt_constructor:
   prompt_strategy: "ground_truth"
   prompt_file_path: "../../notebooks/output/train_prompts_all.json"
-  use_diverse_prompts: false
+  use_diverse_templates: false
 
   optimal_thresholds:
     "Atelectasis": 0.5

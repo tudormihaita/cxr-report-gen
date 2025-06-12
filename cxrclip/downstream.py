@@ -7,14 +7,15 @@ import numpy as np
 
 from tqdm import tqdm
 from torch.optim import AdamW
+from transformers import get_scheduler
 from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
+
 from utils.logger import LoggerManager
 from utils.training_monitor import TrainingMonitor
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 bleu = evaluate.load("bleu")
 rouge = evaluate.load("rouge")
-meteor = evaluate.load("meteor")
 
 
 class CxrDecoderTrainer:
@@ -54,6 +55,8 @@ class CxrDecoderTrainer:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
+        self.run_validation = config.get('run_validation', False)
+
         steps_per_epoch = len(train_loader)
         if config.get('max_epochs') is None:
             self.max_steps = config.get('max_steps', 10000)
@@ -71,19 +74,19 @@ class CxrDecoderTrainer:
             betas=(0.9, 0.999)
         )
 
-        scheduler_type = config.get('scheduler_type', 'cosine')
+        scheduler_type = config.get('scheduler_type', 'linear')
         if scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
-                T_max=self.max_steps - self.warmup_steps,
+                T_max=self.max_steps,
                 eta_min=self.min_lr
             )
-        elif scheduler_type == 'cosine_restarts':
-            self.scheduler = CosineAnnealingWarmRestarts(
-                self.optimizer,
-                T_0=self.max_steps - self.warmup_steps,
-                T_mult=config.get('restarts_t_mult', 1),
-                eta_min=self.min_lr
+        elif scheduler_type == 'linear':
+            self.scheduler = get_scheduler(
+                name='linear',
+                optimizer=self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=self.max_steps
             )
         else:
             raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
@@ -109,7 +112,6 @@ class CxrDecoderTrainer:
         self.logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%})")
 
     def warmup_lr_schedule(self, step):
-        """Linear warmup of learning rate"""
         lr = self.warmup_lr + (self.init_lr - self.warmup_lr) * step / self.warmup_steps
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
@@ -160,9 +162,6 @@ class CxrDecoderTrainer:
                     self.best_val_loss = val_metrics['val_loss']
                     self.save_checkpoint(is_best=True, suffix='best_loss')
 
-                if val_metrics.get('bleu', 0) > self.best_bleu:
-                    self.best_bleu = val_metrics.get('bleu', 0)
-                    self.save_checkpoint(is_best=True, suffix='best_bleu')
 
                 if early_stop:
                     self.logger.info(
@@ -246,51 +245,61 @@ class CxrDecoderTrainer:
             loss = loss_dict['total']
             total_loss += loss
 
-            image_embeds = self.model.encode_image(images)
-            image_embeds = self.model.image_proj(image_embeds)
+            if phase == 'val' and not self.run_validation:
+                continue
 
             captions = self.model.generate(
-                image_embeds=image_embeds,
+                images=images,
                 findings=batch['labels'],
                 temperature=1.0,
                 repetition_penalty=1.4,
                 device=self.device,
             )
 
-            references.extend([[r] for r in reports])  # BLEU expects list of lists
+            references.extend([[r] for r in reports])
             hypotheses.extend(captions)
 
         if phase == "test":
-            bleu_score = bleu.compute(predictions=hypotheses, references=references)
             rouge_scores = rouge.compute(predictions=hypotheses, references=references)
-            meteor_score = meteor.compute(predictions=hypotheses, references=references)
+            bleu_result = bleu.compute(predictions=hypotheses, references=references, max_order=4, smooth=True)
+            bleu_scores = {
+                f"{phase}_bleu": bleu_result["bleu"],
+                f"{phase}_bleu1": bleu_result.get("precisions", [0] * 4)[0],
+                f"{phase}_bleu2": bleu_result.get("precisions", [0] * 4)[1],
+                f"{phase}_bleu3": bleu_result.get("precisions", [0] * 4)[2],
+                f"{phase}_bleu4": bleu_result.get("precisions", [0] * 4)[3],
+            }
 
             metrics = {
                 f"{phase}_loss": total_loss / len(dataloader),
-                "bleu": bleu_score["bleu"],
-                "rouge1": rouge_scores["rouge1"],
-                "rouge2": rouge_scores["rouge2"],
-                "rougeL": rouge_scores["rougeL"],
-                "meteor": meteor_score["meteor"]
+                **bleu_scores,
+                f"{phase}_rouge1": rouge_scores["rouge1"],
+                f"{phase}_rouge2": rouge_scores["rouge2"],
+                f"{phase}_rougeL": rouge_scores["rougeL"],
             }
         else:
+            # bleu_score = bleu.compute(predictions=hypotheses, references=references)
             metrics = {
                 f"{phase}_loss": total_loss / len(dataloader),
+                # f"{phase}_bleu": bleu_score["bleu"],
             }
 
-        self.logger.info(f"{phase.capitalize()} sample:")
-        samples = np.random.randint(0, len(hypotheses), size=3)
-        for i in samples:
-            self.logger.info(f"Reference: {references[i][0]}")
-            self.logger.info("-" * 50)
-            self.logger.info(f"Prediction: {hypotheses[i]}")
-        safe_eval_metrics = {
+        if phase == 'test' or self.run_validation:
+            self.logger.info(f"{phase.capitalize()} sample:")
+            samples = np.random.randint(0, len(hypotheses), size=3)
+            for i in samples:
+                self.logger.info(f"Reference: {references[i][0]}")
+                self.logger.info(f"Prediction: {hypotheses[i]}")
+                self.logger.info("-" * 50)
+
+        eval_metrics = {
             k: (v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v)
             for k, v in metrics.items()
         }
-        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(safe_eval_metrics, indent=2)}")
+        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(eval_metrics, indent=2)}")
 
-        return metrics
+        self.model.train()
+        return eval_metrics
 
     def save_checkpoint(self, step=None, is_best=False, suffix=None):
         checkpoint = {
@@ -316,7 +325,6 @@ class CxrDecoderTrainer:
             self.logger.info(f"Saved best model to {best_path}")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load model checkpoint"""
         if not os.path.exists(checkpoint_path):
             self.logger.warning(f"Checkpoint {checkpoint_path} does not exist. Starting from scratch.")
             return
@@ -327,7 +335,5 @@ class CxrDecoderTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.global_step = checkpoint['global_step']
         self.epoch = checkpoint['epoch']
-        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        self.best_bleu = checkpoint.get('best_bleu', 0.0)
 
         self.logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {self.epoch}, step {self.global_step})")

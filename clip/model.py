@@ -7,7 +7,6 @@ from typing import Tuple, Union
 from collections import OrderedDict
 
 from constants import *
-from classifier.model import ChexpertConceptClassifier
 
 
 class LayerNorm(nn.LayerNorm):
@@ -254,8 +253,12 @@ class CLIP(nn.Module):
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        self.medical_concept_classifier = ChexpertConceptClassifier(self.vision_width, self.transformer_width,
-                                                                    num_medical_concepts)
+        # self.medical_concept_classifier = ChexpertConceptClassifier(self.vision_width, self.transformer_width, num_medical_concepts)
+        self.medical_concept_classifier = nn.Sequential(
+            nn.Linear(self.vision_width, self.transformer_width),
+            nn.ReLU(),
+            nn.Linear(self.transformer_width, num_medical_concepts)
+        )
         self.concept_embedding = nn.Parameter(torch.empty(num_medical_concepts, embed_dim))
 
         self.initialize_parameters()

@@ -495,7 +495,7 @@ def plot_roc_curves(
         optimal_tpr = tpr[optimal_idx]
 
         # plot ROC curve
-        ax.plot(fpr, tpr, color='darkorange', lw=2,
+        ax.plot(fpr, tpr, color='#ffbb78', lw=2,
                 label=f'ROC curve (AUC = {roc_auc:.3f})')
 
         # plot diagonal line (random classifier)

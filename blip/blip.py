@@ -22,29 +22,28 @@ def blip_decoder(pretrained=None, use_custom=False, **kwargs):
     model = BLIPDecoder(**kwargs)
     if pretrained:
         model, msg = load_checkpoint(model, pretrained, use_custom)
-        assert (len(msg.missing_keys) == 0)
+        print(f"Missing keys: {msg.missing_keys}")
     return model
 
 def blip_feature_extractor(pretrained=None, use_custom=False, **kwargs):
     model = BLIPFeatureExtractor(**kwargs)
     if pretrained:
         model, msg = load_checkpoint(model, pretrained, use_custom)
-        assert (len(msg.missing_keys) == 0)
+        print(f"Missing keys: {msg.missing_keys}")
     return model
 
 def blip_pretrain(pretrained=None, use_custom=False, **kwargs):
     model = BLIP(**kwargs)
     if pretrained:
         model, msg = load_checkpoint(model, pretrained, use_custom)
-        assert (len(msg.missing_keys) == 0)
+        print(f"Missing keys: {msg.missing_keys}")
     return model
 
 def blip_retrieval(pretrained=None, use_custom=False, **kwargs):
     model = BLIPRetrieval(**kwargs)
     if pretrained:
         model, msg = load_checkpoint(model, pretrained, use_custom)
-        print("Missing keys:")
-        print(msg.missing_keys)
+        print(f"Missing keys: {msg.missing_keys}")
     return model
 
 

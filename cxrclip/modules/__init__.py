@@ -110,7 +110,7 @@ def load_prompt_constructor(
         pretrained_model,
 ):
     prompt_constructor = PromptConstructor(
-        prompt_strategy=model_config["prompt_strategy"],
+        prompt_strategy=PromptStrategy(model_config["prompt_strategy"]),
         pretrained_model=pretrained_model,
         prompt_file_path=model_config["prompt_file_path"],
         optimal_thresholds=model_config["optimal_thresholds"],

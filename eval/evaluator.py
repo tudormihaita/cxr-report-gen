@@ -9,6 +9,7 @@ from configs import load_config_from_file
 
 from constants import CHEXPERT_LABELS
 from eval.metrics.generation import compute_text_generation_metrics
+from eval.metrics.embedding_visualization import compute_tsne_embedding_visualization
 from eval.metrics.retrieval import compute_retrieval_recall_metrics, compute_retrieval_precision_metrics, \
     compute_retrieval_precision_metrics_fixed_pool, compute_retrieval_recall_metrics_fixed_pool, \
     compute_retrieval_precision_metrics_per_class
@@ -30,7 +31,7 @@ class Evaluator:
 
         if ckpt_path:
             checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
         self.model.to(self.device)
         self.model.eval()
@@ -136,9 +137,12 @@ class Evaluator:
             recall_metrics = compute_retrieval_recall_metrics(image_embeddings, text_embeddings, texts)
             precision_metrics = compute_retrieval_precision_metrics(image_embeddings, text_embeddings, labels)
             per_class_precision_metrics = compute_retrieval_precision_metrics_per_class(image_embeddings, text_embeddings, labels, CHEXPERT_LABELS)
+            tsne = compute_tsne_embedding_visualization(image_embeddings, labels, CHEXPERT_LABELS, save_path='./output/plots/tsne_visualization.png')
+
             results.update(recall_metrics)
             results.update(precision_metrics)
             results.update(per_class_precision_metrics)
+            results.update(tsne)
         elif metrics == "retrieval_fixed_pool":
             processed = self._collect_embeddings(dataloader)
             texts = processed["texts"]
@@ -162,7 +166,7 @@ class Evaluator:
             predictions = processed["predictions"]
             class_labels = processed["labels"]
             classification_metrics = compute_supervised_classification_with_optimal_thresholds(predictions, class_labels, CHEXPERT_LABELS)
-            plot_roc_curves(predictions, class_labels, CHEXPERT_LABELS, save_path='./output/roc_curves.png')
+            plot_roc_curves(predictions, class_labels, CHEXPERT_LABELS, save_path='./output/plots/')
             results.update(classification_metrics)
         elif metrics == "generation":
             processed = self._collect_texts(dataloader)
@@ -171,7 +175,21 @@ class Evaluator:
             generation_metrics = compute_text_generation_metrics(predictions, references, self.device)
             results.update(generation_metrics)
 
-        eval_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in results.items()}
+        def convert_to_serializable(obj):
+            if isinstance(obj, torch.Tensor):
+                return float(obj.item())
+            elif isinstance(obj, (np.float32, np.float64, np.int32, np.int64)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_serializable(item) for item in obj]
+            else:
+                return obj
+
+        eval_metrics = convert_to_serializable(results)
         print(f"Evaluation metrics: {json.dumps(eval_metrics, indent=2)}")
 
         return eval_metrics

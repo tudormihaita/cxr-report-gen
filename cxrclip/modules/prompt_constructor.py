@@ -40,19 +40,20 @@ class PromptConstructor(nn.Module):
         self.default_threshold = 0.5
 
         if self.prompt_strategy == PromptStrategy.GROUND_TRUTH:
-            self.image_encoder = pretrained_model.image_encoder
+            self.image_encoder = pretrained_model
         elif self.prompt_strategy == PromptStrategy.SUPERVISED:
             self.image_encoder = pretrained_model.image_encoder
             self.classifier = pretrained_model.classifier
         elif self.prompt_strategy == PromptStrategy.ZERO_SHOT:
             self.image_encoder = pretrained_model.image_encoder
-            self.clip_encoder = self.pretrained_model
+            self.clip_encoder = pretrained_model
         else:
             raise ValueError(f"Unsupported prompt strategy: {self.prompt_strategy}")
 
         self.finding_templates = [
-            "Chest X-ray showing {findings}",
+            "{findings}",
 
+            "Chest X-ray showing {findings}",
             "The chest radiograph shows {findings}",
             "Radiographic findings include {findings}",
             "Notable findings: {findings}",
@@ -67,6 +68,8 @@ class PromptConstructor(nn.Module):
         ]
 
         self.normal_templates = [
+            "No Finding",
+
             "No abnormal findings",
             "Normal chest radiograph",
             "No acute findings",
@@ -81,14 +84,27 @@ class PromptConstructor(nn.Module):
         ]
 
     @staticmethod
-    def get_findings_from_labels(labels: torch.Tensor):
+    def get_findings_from_labels(labels):
         findings_list = []
-        for label_tensor in labels:
-            if label_tensor[8] == 1:  # label position 8 is 'No Finding' for CheXpert
-                findings_list.append([])
-            else:
-                findings = [CHEXPERT_LABELS[i] for i in torch.where(label_tensor == 1)[0].detach().cpu().numpy()]
-                findings_list.append(findings)
+        if isinstance(labels, (list, tuple)):
+            labels = torch.tensor(labels)
+        elif isinstance(labels, np.ndarray):
+            labels = torch.from_numpy(labels)
+
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+
+        labels_numpy = labels.detach().cpu().numpy()
+        for i in range(labels_numpy.shape[0]):
+                label_array = labels_numpy[i]
+
+                no_finding_value = label_array[8]
+                if no_finding_value == 1:
+                    findings_list.append([])
+                else:
+                    positive_indices = np.where(label_array == 1)[0]
+                    findings = [CHEXPERT_LABELS[i] for i in positive_indices if i < len(CHEXPERT_LABELS)]
+                    findings_list.append(findings)
 
         return findings_list
 
@@ -97,12 +113,7 @@ class PromptConstructor(nn.Module):
         if not findings:
             return ""
 
-        if len(findings) == 1:
-            return findings[0]
-        elif len(findings) == 2:
-            return f"{findings[0]} and {findings[1]}"
-        else:
-            return ", ".join(findings[:-1]) + f" and {findings[-1]}"
+        return ", ".join(findings)
 
     def construct_prompts(self, labels: torch.Tensor):
         findings_list = self.get_findings_from_labels(labels)
@@ -110,7 +121,7 @@ class PromptConstructor(nn.Module):
         prompts = []
         for findings in findings_list:
             if findings:
-                findings_text = self.format_findings_text(findings)
+                findings_text = self._format_findings_text(findings)
                 if self.use_diverse_templates:
                     template = random.choice(self.finding_templates)
                 else:
@@ -128,7 +139,8 @@ class PromptConstructor(nn.Module):
     def _predict_labels_supervised(self, images):
         with torch.no_grad():
             image_features = self.image_encoder(images)
-            cls_pred = self.classifier(image_features)
+            global_features = image_features[:, 0]
+            cls_pred = self.classifier(global_features)
             predictions = torch.sigmoid(cls_pred).detach().cpu().numpy()
 
             binary_labels = np.zeros_like(predictions)
@@ -136,7 +148,8 @@ class PromptConstructor(nn.Module):
                 threshold = self.optimal_thresholds.get(class_name, self.default_threshold)
                 binary_labels[:, i] = (predictions[:, i] > threshold).astype(int)
 
-            return torch.from_numpy(binary_labels).long()
+            label_tensor = torch.from_numpy(binary_labels).long()
+        return label_tensor
 
     def _predict_labels_zero_shot(
             self,
@@ -214,7 +227,9 @@ class PromptConstructor(nn.Module):
             threshold = self.optimal_thresholds.get(class_name, self.default_threshold)
             binary_labels[:, i] = (positive_probabilities[:, i] > threshold).astype(int)
 
-        return torch.from_numpy(binary_labels).long()
+        label_tensor = torch.from_numpy(binary_labels).long()
+
+        return label_tensor
 
     def predict_findings(self, images, tokenizer=None, labels=None, device=None):
         if self.prompt_strategy == PromptStrategy.GROUND_TRUTH:

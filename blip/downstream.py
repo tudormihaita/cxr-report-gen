@@ -20,7 +20,7 @@ from constants import BLIP_BERT_TYPE, BLIP_SPECIALIZED_BERT_TYPE
 
 class BLIPRetrieval(nn.Module):
     def __init__(self,
-                 med_config='../configs/med.json',
+                 med_config='../configs/baselines/med.json',
                  image_size=384,
                  vit='base',
                  vit_grad_ckpt=False,
@@ -228,7 +228,7 @@ class BLIPRetrieval(nn.Module):
 
 class BLIPFeatureExtractor(nn.Module):
     def __init__(self,
-                 config='../configs/med.json',
+                 config='../configs/baselines/med.json',
                  image_size=224,
                  vit='base',
                  vit_grad_ckpt=False,
@@ -282,7 +282,7 @@ class BLIPFeatureExtractor(nn.Module):
 
 class BLIPDecoder(nn.Module):
     def __init__(self,
-                 config='../configs/med.json',
+                 config='../configs/baselines/med.json',
                  image_size=384,
                  vit='base',
                  vit_grad_ckpt=False,

@@ -15,7 +15,7 @@ def build_model(model_config: Dict, loss_config: Dict, tokenizer: PreTrainedToke
         model_type = model_config["image_encoder"]["model_type"] if "model_type" in model_config["image_encoder"] else "vit"
         model = CxrCLIPClassifier(model_config, model_type)
     elif model_config["name"].lower() == "downstream_decoder":
-        model = CxrCLIPReportDecoder(model_config, pretrained_backbone, tokenizer)
+        model = CxrCLIPReportDecoder(model_config, tokenizer, pretrained_backbone)
     else:
         raise KeyError(f"Not supported model: {model_config['name']}")
     return model

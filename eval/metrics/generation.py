@@ -1,3 +1,4 @@
+import random
 import evaluate
 import numpy as np
 from typing import List, Dict, Union, Optional
@@ -28,6 +29,17 @@ def compute_text_generation_metrics(
         else:
             str_references.append(ref)
             list_references.append([ref])
+
+    try:
+        print("Sample predictions vs. references:")
+        samples = random.sample(list(zip(predictions, str_references)), min(5, len(predictions)))
+        for i, (pred, ref) in enumerate(samples):
+            print(f"Sample {i+1}")
+            print(f"Reference: {ref}")
+            print(f"Prediction: {pred}")
+            print("-" * 50)
+    except Exception as e:
+        print(f"Error displaying sample predictions: {e}")
 
     metrics = {}
     bleu_metrics = compute_bleu_score(predictions, list_references)

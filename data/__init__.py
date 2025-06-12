@@ -52,7 +52,7 @@ def load_tokenizer(pretrained_model_name_or_path, cache_dir, **kwargs):
 
 
 def load_transform(split: str = "train", transform_config: Dict = None):
-    assert split in {"train", "val", "test"}
+    assert split in {"train", "val", "test", "inference"}
 
     config = []
     if transform_config:
