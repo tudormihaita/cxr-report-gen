@@ -24,6 +24,7 @@ class RadiologyReportDecoderTrainer:
             model,
             config,
             loss_fn,
+            prompt_constructor,
             train_loader,
             val_loader=None,
             test_loader=None,
@@ -35,6 +36,7 @@ class RadiologyReportDecoderTrainer:
         self.config = config
         self.loss_fn = loss_fn
         self.model = model.to(device)
+        self.prompt_constructor = prompt_constructor
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -162,7 +164,6 @@ class RadiologyReportDecoderTrainer:
                     self.best_val_loss = val_metrics['val_loss']
                     self.save_checkpoint(is_best=True, suffix='best_loss')
 
-
                 if early_stop:
                     self.logger.info(
                         f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
@@ -188,9 +189,16 @@ class RadiologyReportDecoderTrainer:
         if self.global_step < self.warmup_steps:
             self.warmup_lr_schedule(self.global_step)
 
+        prompts = self.prompt_constructor(
+            images=batch['images'],
+            labels=batch['labels'],
+            tokenizer=self.model.tokenizer,
+            device=self.model.device,
+        )
+
         if self.scaler is not None:
             with autocast('cuda'):
-                outputs = self.model(batch, self.device)
+                outputs = self.model(batch, prompts, self.device)
                 loss_dict = self.loss_fn(**outputs)
                 loss = loss_dict['total']
                 scaled_loss = loss / self.gradient_accumulation_steps
@@ -208,7 +216,7 @@ class RadiologyReportDecoderTrainer:
                 if self.global_step >= self.warmup_steps:
                     self.scheduler.step()
         else:
-            outputs = self.model(batch, self.device)
+            outputs = self.model(batch, prompts, self.device)
             loss_dict = self.loss_fn(**outputs)
             loss = loss_dict['total']
             scaled_loss = loss / self.gradient_accumulation_steps
@@ -240,7 +248,14 @@ class RadiologyReportDecoderTrainer:
             images = batch['images'].to(self.device)
             reports = batch['texts']
 
-            outputs = self.model(batch, self.device)
+            prompts = self.prompt_constructor(
+                images=images,
+                labels=batch['labels'],
+                tokenizer=self.model.tokenizer,
+                device=self.model.device,
+            )
+
+            outputs = self.model(batch, prompts, self.device)
             loss_dict = self.loss_fn(**outputs)
             loss = loss_dict['total']
             total_loss += loss
@@ -250,7 +265,7 @@ class RadiologyReportDecoderTrainer:
 
             captions = self.model.generate(
                 images=images,
-                findings=batch['labels'],
+                prompts=prompts,
                 temperature=1.0,
                 repetition_penalty=1.4,
                 device=self.device,
@@ -278,10 +293,8 @@ class RadiologyReportDecoderTrainer:
                 f"{phase}_rougeL": rouge_scores["rougeL"],
             }
         else:
-            # bleu_score = bleu.compute(predictions=hypotheses, references=references)
             metrics = {
                 f"{phase}_loss": total_loss / len(dataloader),
-                # f"{phase}_bleu": bleu_score["bleu"],
             }
 
         if phase == 'test' or self.run_validation:

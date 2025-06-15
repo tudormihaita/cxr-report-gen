@@ -1,21 +1,21 @@
+import os
 import torch
 import torch.nn as nn
 from typing import Dict, TypeVar
 
 from constants import CHEXPERT_LABELS
-from .modules.prompt_constructor import PromptStrategy
-from .modules import  load_text_decoder, load_pretrained_image_encoder_weights, \
-    load_prompt_constructor, load_pretrained_weights
+from utils.logger import LoggerManager
+from .modules import load_text_decoder, load_image_encoder, \
+    load_pretrained_image_encoder_weights, load_hf_checkpoint
 
 T = TypeVar("T", bound="Module")
-
+log = LoggerManager.get_logger(__name__)
 
 class CLIPXRGen(nn.Module):
     def __init__(
             self,
             model_config: Dict,
             tokenizer,
-            pretrained_model: nn.Module = None
     ):
         super().__init__()
 
@@ -28,29 +28,30 @@ class CLIPXRGen(nn.Module):
         self.max_length = model_config["text_decoder"]["max_length"]
         self.min_length = model_config["text_decoder"]["min_length"]
         self.max_prompt_length = model_config["text_decoder"]["max_prompt_length"]
-        assert(self.min_length - self.max_prompt_length >= 0), "Minimum length must be greater than or equal to max prompt length"
+        assert (self.min_length - self.max_prompt_length >= 0), "Minimum length must be greater than or equal to max prompt length"
 
-        if pretrained_model is None:
-            self.image_encoder = load_pretrained_image_encoder_weights(model_config)
-        else:
-            if model_config["load_backbone_weights"] is None:
-                raise ValueError("Pretrained model weights are currently required for report decoder initialization.")
-            else:
-                pretrained_model_loaded = load_pretrained_weights(pretrained_model, model_config)
-            self.image_encoder = pretrained_model_loaded.image_encoder
-
+        self.image_encoder = load_image_encoder(model_config["image_encoder"])
         encoder_hidden_size = model_config["image_encoder"].get("hidden_size", 768)
         self.text_decoder = load_text_decoder(model_config["text_decoder"], len(self.tokenizer), encoder_hidden_size)
 
         decoder_hidden_size = self.text_decoder.config.hidden_size
         self.image_proj = nn.Linear(encoder_hidden_size, decoder_hidden_size)
 
-        if pretrained_model is None:
-            self.prompt_strategy = PromptStrategy.GROUND_TRUTH
-            self.prompt_constructor = load_prompt_constructor(model_config["prompt_constructor"], self.image_encoder)
-        else:
-            self.prompt_strategy = model_config["prompt_constructor"]["prompt_strategy"]
-            self.prompt_constructor = load_prompt_constructor(model_config["prompt_constructor"], pretrained_model)
+        if model_config["load_pretrained_weights"]:
+            log.info("Loading pretrained weights for encoder-decoder setup")
+
+            ckpt_path = model_config["load_pretrained_weights"]
+            ckpt = load_hf_checkpoint(ckpt_path, map_location="cpu")
+            if "model_state_dict" not in ckpt:
+                raise KeyError(f"Checkpoint does not contain key 'model_state_dict'")
+
+            self.load_state_dict(ckpt["model_state_dict"], strict=True)
+            if model_config.get("freeze_backbone_weights", False):
+                log.info("Freezing model weights")
+                for param in self.parameters():
+                    param.requires_grad = False
+        elif model_config["load_backbone_weights"]:
+            self.image_encoder = load_pretrained_image_encoder_weights(model_config, "model_state_dict")
 
     def train(self: T, mode: bool = True) -> T:
         if not isinstance(mode, bool):
@@ -112,16 +113,17 @@ class CLIPXRGen(nn.Module):
 
         return text
 
-    def _prepare_findings_prompts(self, concept_labels):
-        generated_prompts = self.prompt_constructor.construct_prompts(concept_labels)
+    @staticmethod
+    def _prepare_findings_prompts(concept_prompts):
         input_prompts = []
-        for prompt in generated_prompts:
+        for prompt in concept_prompts:
             input_prompt = f"<findings> {prompt} <sep>"
             input_prompts.append(input_prompt)
 
         return input_prompts
 
-    def _create_training_inputs(self, prompts, reports):
+    @staticmethod
+    def _create_training_inputs(prompts, reports):
         full_inputs = []
         for prompt, report in zip(prompts, reports):
             full_input = f"{prompt} {report.strip()}"
@@ -139,20 +141,7 @@ class CLIPXRGen(nn.Module):
 
         return labels
 
-    def _predict_findings(self, batch, device):
-        if self.prompt_strategy == PromptStrategy.GROUND_TRUTH:
-            if batch["labels"] is None:
-                raise ValueError("Labels are required for ground truth prompt strategy.")
-            return batch["labels"]
-
-        return self.prompt_constructor.predict_findings(
-            batch["images"].to(device),
-            self.tokenizer,
-            labels=batch["labels"],
-            device=device,
-        )
-
-    def forward(self, batch, device=None):
+    def forward(self, batch, prompts=None, device=None):
         device = batch["images"].device if device is None else device
 
         image_embeds = self.encode_image(batch["images"].to(device))
@@ -160,12 +149,10 @@ class CLIPXRGen(nn.Module):
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=device)
 
         texts = batch["texts"]
-        labels = self._predict_findings(batch, device)
-
-        if labels is not None:
-            prompts = self._prepare_findings_prompts(labels)
-        else:
+        if prompts is None:
             prompts = ["<findings> <sep>"] * len(texts)
+        else:
+            prompts = self._prepare_findings_prompts(prompts)
 
         full_texts = self._create_training_inputs(prompts, texts)
 
@@ -201,26 +188,23 @@ class CLIPXRGen(nn.Module):
             "output_loss": outputs.loss,
         }
 
-    def generate(self, images, findings=None,
+    def generate(self, images, prompts=None,
                  top_p=0.9, temperature=1.0, repetition_penalty=1.2,
                  num_beams=None, sample=False, device=None
-        ):
+                 ):
         if num_beams is None:
             num_beams = self.beam_size
         max_new_tokens = self.max_length - self.max_prompt_length
 
         with torch.no_grad():
             image_embeds = self.encode_image(images)
-            image_embeds = image_embeds.unsqueeze(1) # add sequence dimension
+            image_embeds = image_embeds.unsqueeze(1)  # add sequence dimension
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=device)
 
-            batch = { "images": images, "labels": findings }
-            labels = self._predict_findings(batch, device)
-
-            if labels is not None and isinstance(labels, (list, torch.Tensor)) and len(labels) > 0:
-                prompts = self._prepare_findings_prompts(labels)
+            if prompts is None:
+                prompts = ["<findings> <sep>"] * images.size(0)  # batch size
             else:
-                prompts = ["<findings> <sep>"] * images.size(0)
+                prompts = self._prepare_findings_prompts(prompts)
 
             prompt_inputs = self.tokenizer(
                 prompts,

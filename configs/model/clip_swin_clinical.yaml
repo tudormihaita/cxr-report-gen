@@ -1,4 +1,5 @@
 name: "pretrain_encoder"
+load_pretrained_weights: "./output/clip-xrgen-pretrained-mscl.pt"
 temperature: 0.07
 
 image_encoder:

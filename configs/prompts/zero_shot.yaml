@@ -1,0 +1,45 @@
+  name: "prompt_constructor"
+  prompt_strategy: "zero_shot"
+  prompt_file_path: "../../notebooks/output/train_prompts_all.json"
+  use_diverse_templates: false
+
+  optimal_thresholds:
+    "Atelectasis": 0.5
+    "Cardiomegaly": 0.5
+    "Consolidation": 0.5
+    "Edema": 0.5
+    "Enlarged Cardiomediastinum": 0.5
+    "Fracture": 0.5
+    "Lung Lesion": 0.5
+    "Lung Opacity": 0.5
+    "No Finding": 0.5
+    "Pleural Effusion": 0.5
+    "Pleural Other": 0.5
+    "Pneumonia": 0.5
+    "Pneumothorax": 0.5
+    "Support Devices": 0.5
+
+  pretrained_backbone:
+    load_pretrained_weights: "./output/clip-xrgen-pretrained-mscl.pt"
+    temperature: 0.07
+
+    image_encoder:
+        source: "huggingface"
+        name: 'microsoft/swin-tiny-patch4-window7-224'
+        pretrained: true
+        model_type: 'swin'
+
+    text_encoder:
+        source: "huggingface"
+        name: emilyalsentzer/Bio_ClinicalBERT
+        pretrained: true
+        gradient_checkpointing: false
+        pooling: "eos"
+        cache_dir: "huggingface/"
+        trust_remote_code: true
+        mlm_head: true
+
+    projection_head:
+        name: "linear"
+        dropout: 0.1
+        proj_dim: 512

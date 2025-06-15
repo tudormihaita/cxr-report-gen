@@ -18,16 +18,26 @@ from eval.metrics.classification import compute_zero_shot_classification_with_op
 
 
 class Evaluator:
-    def __init__(self, model_config_path, loss_config_path, tokenizer_config_path, prompts_path, ckpt_path=None, device=None):
+    def __init__(
+            self,
+            model_config_path,
+            tokenizer_config_path,
+            train_prompts_path,
+            prompt_constructor_path=None,
+            ckpt_path=None,
+            device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.prompts_path = prompts_path
+        self.train_prompts_path = train_prompts_path
 
         tokenizer_config = load_config_from_file(tokenizer_config_path)
         self.tokenizer = load_tokenizer(**tokenizer_config)
 
         model_config = load_config_from_file(model_config_path)
-        loss_config = load_config_from_file(loss_config_path)
-        self.model = build_model(model_config, loss_config, self.tokenizer)
+        self.model = build_model(model_config, self.tokenizer)
+
+        if model_config["name"].lower() == "downstream_decoder":
+            prompt_constructor_config = load_config_from_file(prompt_constructor_path)
+            self.prompt_constructor = build_model(prompt_constructor_config, self.tokenizer)
 
         if ckpt_path:
             checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
@@ -102,11 +112,17 @@ class Evaluator:
         for batch in tqdm(dataloader, desc="Extracting texts"):
             images = batch['images'].to(self.device)
             reports = batch['texts']
-            findings = batch['labels']
+
+            prompts = self.prompt_constructor(
+                images=images,
+                labels=batch["labels"],
+                tokenizer=self.tokenizer,
+                device=self.device
+            )
 
             preds = self.model.generate(
                 images=images,
-                findings=findings,
+                prompts=prompts,
                 temperature=1.0,
                 repetition_penalty=1.4,
                 device=self.device
@@ -159,7 +175,7 @@ class Evaluator:
             labels = processed["labels"]
             image_embeddings = processed["image_embeddings"]
 
-            classification_metrics = compute_zero_shot_classification_with_optimal_thresholds(self.model, self.tokenizer, image_embeddings, labels, self.prompts_path, CHEXPERT_LABELS, self.device)
+            classification_metrics = compute_zero_shot_classification_with_optimal_thresholds(self.model, self.tokenizer, image_embeddings, labels, self.train_prompts_path, CHEXPERT_LABELS, self.device)
             results.update(classification_metrics)
         elif metrics == "classification_supervised":
             processed = self._collect_predictions(dataloader)
@@ -169,6 +185,9 @@ class Evaluator:
             plot_roc_curves(predictions, class_labels, CHEXPERT_LABELS, save_path='./output/plots/')
             results.update(classification_metrics)
         elif metrics == "generation":
+            if self.prompt_constructor is None:
+                raise ValueError("Prompt constructor is required for text generation evaluation.")
+
             processed = self._collect_texts(dataloader)
             references = processed["references"]
             predictions = processed["hypotheses"]

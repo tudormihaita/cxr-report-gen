@@ -18,12 +18,15 @@ class CLIPXRGenPipeline:
             model,
             tokenizer,
             transform,
+            prompt_constructor,
             device: torch.device,
             config: Dict[str, Any],
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.transform = transform
+        self.prompt_constructor = prompt_constructor
+
         self.device = device
         self.config = config
 
@@ -32,12 +35,10 @@ class CLIPXRGenPipeline:
     @classmethod
     def from_pretrained(
             cls,
-            model_path: Union[str, Path],
             config_path: Union[str, Path],
             device: Union[str, torch.device] = "auto",
             **kwargs
     ) -> "CLIPXRGenPipeline":
-        model_path = Path(model_path)
         config_path = Path(config_path)
 
         if device == "auto":
@@ -45,7 +46,6 @@ class CLIPXRGenPipeline:
         elif isinstance(device, str):
             device = torch.device(device)
 
-        log.info(f"Loading model from {model_path}")
         log.info(f"Using device: {device}")
 
         if not config_path.is_file():
@@ -57,35 +57,15 @@ class CLIPXRGenPipeline:
         tokenizer = load_tokenizer(**config["tokenizer"])
         transform = load_transform(split="inference", transform_config=config["transform"])
 
-        backbone = build_model(config["encoder"]["model"], config["encoder"]["loss"], tokenizer)
-        model = build_model(config["decoder"]["model"], config["decoder"]["loss"], tokenizer,
-                            pretrained_backbone=backbone)
-
-        if model_path.exists():
-            try:
-                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-                missing_keys, unexpected_keys = model.load_state_dict(
-                    checkpoint["model_state_dict"],
-                    strict=False
-                )
-
-                log.info(f"Loaded decoder checkpoint")
-                log.info(f"Missing keys: {len(missing_keys)}")
-                log.info(f"Unexpected keys: {len(unexpected_keys)}")
-
-                log.info(f"Loaded model from {model_path}")
-            except Exception as e:
-                log.error(f"Failed to load weights from {model_path}: {e}")
-                raise RuntimeError(f"Failed to load model weights from {model_path}: {e}")
-        else:
-            log.warning(f"Checkpoint {model_path} not found Initializing model without pre-trained weights.")
-
+        model = build_model(config, tokenizer)
         model = model.to(device)
+        prompt_constructor = build_model(config["prompt_constructor"], tokenizer)
 
         return cls(
             model=model,
             tokenizer=tokenizer,
             transform=transform,
+            prompt_constructor=prompt_constructor,
             device=device,
             config=config
         )
@@ -118,9 +98,16 @@ class CLIPXRGenPipeline:
 
         with torch.no_grad():
             try:
+                prompts = self.prompt_constructor(
+                    images=image_tensor,
+                    labels=findings,
+                    tokenizer=self.tokenizer,
+                    device=self.device,
+                )
+
                 reports = self.model.generate(
                     images=image_tensor,
-                    findings=findings,
+                    prompts=prompts,
                     num_beams=num_beams,
                     temperature=temperature,
                     top_p=top_p,
@@ -153,9 +140,8 @@ class CLIPXRGenPipeline:
         }
 
 if __name__ == "__main__":
-    from api import MODEL_PATH, CONFIG_PATH
+    from api import CONFIG_PATH
     pipeline = CLIPXRGenPipeline.from_pretrained(
-        model_path=MODEL_PATH,
         config_path=CONFIG_PATH,
     )
 

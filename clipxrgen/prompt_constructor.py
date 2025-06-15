@@ -12,16 +12,16 @@ from data import load_prompts_from_json
 
 
 class PromptStrategy(Enum):
-    GROUND_TRUTH = "ground_truth"
+    TEACHER_FORCING = "teacher_forcing"
     SUPERVISED = "supervised"
     ZERO_SHOT = "zero_shot"
 
 
-class PromptConstructor(nn.Module):
+class ConceptPromptBuilder(nn.Module):
     def __init__(
             self,
             prompt_strategy: PromptStrategy,
-            pretrained_model: nn.Module,
+            pretrained_backbone: nn.Module,
             prompt_file_path: str,
             use_diverse_templates: bool = False,
             optimal_thresholds: Optional[Dict[str, float]] = None,
@@ -30,25 +30,14 @@ class PromptConstructor(nn.Module):
     ):
         super().__init__()
         self.prompt_strategy = prompt_strategy
+        self.backbone = pretrained_backbone
+        self.default_threshold = 0.5
 
         self.use_diverse_templates = use_diverse_templates
         self.optimal_thresholds = optimal_thresholds or {}
         self.prompt_file_path = prompt_file_path
         self.max_length = max_length
         self.random_seed = random_seed
-
-        self.default_threshold = 0.5
-
-        if self.prompt_strategy == PromptStrategy.GROUND_TRUTH:
-            self.image_encoder = pretrained_model
-        elif self.prompt_strategy == PromptStrategy.SUPERVISED:
-            self.image_encoder = pretrained_model.image_encoder
-            self.classifier = pretrained_model.classifier
-        elif self.prompt_strategy == PromptStrategy.ZERO_SHOT:
-            self.image_encoder = pretrained_model.image_encoder
-            self.clip_encoder = pretrained_model
-        else:
-            raise ValueError(f"Unsupported prompt strategy: {self.prompt_strategy}")
 
         self.finding_templates = [
             "{findings}",
@@ -115,32 +104,11 @@ class PromptConstructor(nn.Module):
 
         return ", ".join(findings)
 
-    def construct_prompts(self, labels: torch.Tensor):
-        findings_list = self.get_findings_from_labels(labels)
-
-        prompts = []
-        for findings in findings_list:
-            if findings:
-                findings_text = self._format_findings_text(findings)
-                if self.use_diverse_templates:
-                    template = random.choice(self.finding_templates)
-                else:
-                    template = self.finding_templates[0]
-                prompt = template.format(findings=findings_text)
-            else:
-                if self.use_diverse_templates:
-                    prompt = random.choice(self.normal_templates)
-                else:
-                    prompt = self.normal_templates[0]
-            prompts.append(prompt)
-
-        return prompts
-
     def _predict_labels_supervised(self, images):
         with torch.no_grad():
-            image_features = self.image_encoder(images)
+            image_features = self.backbone.image_encoder(images)
             global_features = image_features[:, 0]
-            cls_pred = self.classifier(global_features)
+            cls_pred = self.backbone.classifier(global_features)
             predictions = torch.sigmoid(cls_pred).detach().cpu().numpy()
 
             binary_labels = np.zeros_like(predictions)
@@ -163,8 +131,8 @@ class PromptConstructor(nn.Module):
         random.seed(self.random_seed)
         np.random.seed(self.random_seed)
 
-        image_embeddings = self.clip_encoder.encode_image(images)
-        image_embeddings = self.clip_encoder.image_projection(image_embeddings) if hasattr(self.clip_encoder, "image_projection") else image_embeddings
+        image_embeddings = self.backbone.encode_image(images)
+        image_embeddings = self.backbone.image_projection(image_embeddings) if hasattr(self.clip_encoder, "image_projection") else image_embeddings
         image_embeddings = image_embeddings / image_embeddings.norm(dim=1, keepdim=True)
         image_embeddings = image_embeddings.detach().cpu().numpy()
 
@@ -204,12 +172,12 @@ class PromptConstructor(nn.Module):
                         max_length=self.max_length
                     ).to(device)
 
-                    pos_text_features = self.clip_encoder.encode_text(pos_tokens)
-                    neg_text_features = self.clip_encoder.encode_text(neg_tokens)
+                    pos_text_features = self.backbone.encode_text(pos_tokens)
+                    neg_text_features = self.backbone.encode_text(neg_tokens)
 
-                    if hasattr(self.clip_encoder, "text_projection") and self.clip_encoder.text_projection is not None:
-                        pos_text_features = self.clip_encoder.text_projection(pos_text_features)
-                        neg_text_features = self.clip_encoder.text_projection(neg_text_features)
+                    if hasattr(self.backbone, "text_projection") and self.backbone.text_projection is not None:
+                        pos_text_features = self.backbone.text_projection(pos_text_features)
+                        neg_text_features = self.backbone.text_projection(neg_text_features)
 
                     pos_text_features = pos_text_features / pos_text_features.norm(dim=1, keepdim=True)
                     neg_text_features = neg_text_features / neg_text_features.norm(dim=1, keepdim=True)
@@ -231,16 +199,41 @@ class PromptConstructor(nn.Module):
 
         return label_tensor
 
-    def predict_findings(self, images, tokenizer=None, labels=None, device=None):
-        if self.prompt_strategy == PromptStrategy.GROUND_TRUTH:
+    def _predict_findings(self, images, labels=None, tokenizer=None, device=None):
+        if self.prompt_strategy == PromptStrategy.TEACHER_FORCING:
             return labels
         elif self.prompt_strategy == PromptStrategy.SUPERVISED:
             return self._predict_labels_supervised(images)
         elif self.prompt_strategy == PromptStrategy.ZERO_SHOT:
             if tokenizer is None:
-                raise ValueError("tokenizer must be provided for zero-shot classification")
+                raise ValueError("Tokenizer must be provided for zero-shot classification")
             device = device if device is not None else images.device
             return self._predict_labels_zero_shot(images, tokenizer, device)
         else:
             raise ValueError(f"Unsupported prompt strategy: {self.prompt_strategy}")
 
+    def _construct_prompts(self, labels: torch.Tensor):
+        findings_list = self.get_findings_from_labels(labels)
+
+        prompts = []
+        for findings in findings_list:
+            if findings:
+                findings_text = self._format_findings_text(findings)
+                if self.use_diverse_templates:
+                    template = random.choice(self.finding_templates)
+                else:
+                    template = self.finding_templates[0]
+                prompt = template.format(findings=findings_text)
+            else:
+                if self.use_diverse_templates:
+                    prompt = random.choice(self.normal_templates)
+                else:
+                    prompt = self.normal_templates[0]
+            prompts.append(prompt)
+
+        return prompts
+
+    def forward(self, images, labels=None, tokenizer=None, device=None):
+        predicted_labels = self._predict_findings(images, labels, tokenizer, device)
+        prompts = self._construct_prompts(predicted_labels)
+        return prompts

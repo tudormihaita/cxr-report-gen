@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 
@@ -6,12 +7,12 @@ from typing import Dict
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from utils.logger import LoggerManager
-from .modules import load_image_encoder, load_projection_head, load_text_encoder
+from .modules import load_image_encoder, load_projection_head, load_text_encoder, load_hf_checkpoint
 
 log = LoggerManager.get_logger(__name__)
 
 class CLIPXRad(nn.Module):
-    def __init__(self, model_config: Dict, all_loss_config: Dict, tokenizer: PreTrainedTokenizer = None):
+    def __init__(self, model_config: Dict, tokenizer: PreTrainedTokenizer = None):
         super().__init__()
         self.tokenizer = tokenizer
         self.image_encoder = load_image_encoder(model_config["image_encoder"])
@@ -19,7 +20,6 @@ class CLIPXRad(nn.Module):
         self.text_pooling = model_config["text_encoder"]["pooling"]
 
         self.model_config = model_config
-        self.loss_config = {k: v for k, v in all_loss_config.items()}
 
         self.projection = "projection_head" in model_config
 
@@ -31,9 +31,7 @@ class CLIPXRad(nn.Module):
                 embedding_dim=self.text_encoder.out_dim, config_projection_head=model_config["projection_head"]
             )
         else:
-            assert (
-                self.image_encoder.out_dim == self.text_encoder.out_dim
-            ), "Without 'projection_head', embedding_dim of the image and text encoder must be the same."
+            assert (self.image_encoder.out_dim == self.text_encoder.out_dim), "Without 'projection_head', embedding_dim of the image and text encoder must be the same."
 
         self.temperature = model_config["temperature"] if "temperature" in model_config else None
         if self.temperature:
@@ -41,6 +39,20 @@ class CLIPXRad(nn.Module):
         else:
             self.logit_scale = torch.tensor(1, dtype=torch.float32)
             log.warning("Missing temperature scaling factor")
+
+        if self.model_config["load_pretrained_weights"]:
+            log.info("Loading pretrained weights for dual encoder setup")
+
+            ckpt_path = model_config["load_pretrained_weights"]
+            ckpt = load_hf_checkpoint(ckpt_path, map_location="cpu")
+            if "model_state_dict" not in ckpt:
+                raise KeyError(f"Checkpoint does not contain key 'model_state_dict'")
+
+            self.load_state_dict(ckpt["model_state_dict"], strict=True)
+            if model_config.get("freeze_backbone_weights", False):
+                log.info("Freezing model weights")
+                for param in self.parameters():
+                    param.requires_grad = False
 
     def encode_image(self, image):
         image_features = self.image_encoder(image)

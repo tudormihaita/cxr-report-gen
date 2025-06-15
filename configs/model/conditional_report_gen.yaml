@@ -20,24 +20,3 @@ text_decoder:
   min_length: 128
   max_prompt_length: 77
   beam_size: 5
-
-prompt_constructor:
-  prompt_strategy: "ground_truth"
-  prompt_file_path: "../../notebooks/output/train_prompts_all.json"
-  use_diverse_templates: false
-
-  optimal_thresholds:
-    "Atelectasis": 0.5
-    "Cardiomegaly": 0.5
-    "Consolidation": 0.5
-    "Edema": 0.5
-    "Enlarged Cardiomediastinum": 0.5
-    "Fracture": 0.5
-    "Lung Lesion": 0.5
-    "Lung Opacity": 0.5
-    "No Finding": 0.5
-    "Pleural Effusion": 0.5
-    "Pleural Other": 0.5
-    "Pneumonia": 0.5
-    "Pneumothorax": 0.5
-    "Support Devices": 0.5

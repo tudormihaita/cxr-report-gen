@@ -1,17 +1,35 @@
 import os
 import torch
 from typing import Dict
+
+from huggingface_hub import hf_hub_download
 from transformers import BertConfig
 from blip.bert import BertLMHeadModel
 
 from .text_encoder import BertTextEncoder
-from .prompt_constructor import PromptConstructor, PromptStrategy
 from .image_encoder import VisionTransformerEncoder
 from .image_classifier import LinearClassifier, MLPClassifier
 from .projection import LinearProjectionHead, MLPProjectionHead
 
 from utils.logger import LoggerManager
+
 log = LoggerManager.get_logger(__name__)
+
+
+def load_hf_checkpoint(checkpoint_path, map_location="cpu"):
+    if "/" in checkpoint_path and not os.path.exists(checkpoint_path):
+        parts = checkpoint_path.split("/")
+        if len(parts) == 2:
+            repo_id = checkpoint_path
+            filename = "checkpoint.pt"  # default
+        else:
+            repo_id = "/".join(parts[:2])
+            filename = "/".join(parts[2:])
+
+        cached_file = hf_hub_download(repo_id=repo_id, filename=filename)
+        return torch.load(cached_file, map_location=map_location, weights_only=False)
+    else:
+        return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
 
 
 def load_image_encoder(config_image_encoder: Dict):
@@ -103,40 +121,6 @@ def load_text_decoder(config_text_decoder: Dict, vocab_size: int, encoder_hidden
         text_decoder.resize_token_embeddings(vocab_size)
 
         return text_decoder
-
-
-def load_prompt_constructor(
-        model_config: Dict,
-        pretrained_model,
-):
-    prompt_constructor = PromptConstructor(
-        prompt_strategy=PromptStrategy(model_config["prompt_strategy"]),
-        pretrained_model=pretrained_model,
-        prompt_file_path=model_config["prompt_file_path"],
-        optimal_thresholds=model_config["optimal_thresholds"],
-        use_diverse_templates=model_config["use_diverse_templates"],
-    )
-    return prompt_constructor
-
-
-def load_pretrained_weights(model, model_config: Dict, ckpt_key: str = "model_state_dict"):
-    log.info("Loading pre-trained weights")
-    if not os.path.isfile(model_config["load_backbone_weights"]):
-        raise ValueError(f"Cannot find a weight file: {model_config['load_backbone_weights']}")
-
-    ckpt = torch.load(model_config['load_backbone_weights'], map_location="cpu", weights_only=False)
-    if ckpt_key not in ckpt:
-        raise KeyError(f"Checkpoint does not contain key '{ckpt_key}'")
-
-    model.load_state_dict(ckpt[ckpt_key], strict=True)
-    log.info("Loaded model weights successfully")
-
-    if model_config.get("freeze_backbone_weights", False):
-        log.info("Freezing model weights")
-        for param in model.parameters():
-            param.requires_grad = False
-
-    return model
 
 
 def load_pretrained_image_encoder_weights(model_config: Dict, ckpt_key: str = "model_state_dict"):

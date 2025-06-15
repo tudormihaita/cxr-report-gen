@@ -1,0 +1,36 @@
+  name: "prompt_constructor"
+  prompt_strategy: "supervised"
+  prompt_file_path: "../../notebooks/output/train_prompts_all.json"
+  use_diverse_templates: false
+
+  optimal_thresholds:
+    "Atelectasis": 0.5
+    "Cardiomegaly": 0.5
+    "Consolidation": 0.5
+    "Edema": 0.5
+    "Enlarged Cardiomediastinum": 0.5
+    "Fracture": 0.5
+    "Lung Lesion": 0.5
+    "Lung Opacity": 0.5
+    "No Finding": 0.5
+    "Pleural Effusion": 0.5
+    "Pleural Other": 0.5
+    "Pneumonia": 0.5
+    "Pneumothorax": 0.5
+    "Support Devices": 0.5
+
+  pretrained_backbone:
+    load_backbone_weights: "./output/clip-xrgen-pretrained-mscl.pt"
+    freeze_backbone_weights: true
+
+    image_encoder:
+        source: "huggingface"
+        name: 'microsoft/swin-tiny-patch4-window7-224'
+        pretrained: true
+        model_type: 'swin'
+
+    classifier:
+        config:
+            name: "mlp"
+            hidden_dim: 384
+            n_class: 14

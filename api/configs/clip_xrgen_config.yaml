@@ -1,0 +1,72 @@
+name: "downstream_decoder"
+load_pretrained_weights: "tudormihaita/clip-xrgen"
+freeze_pretrained_weights: true
+
+image_encoder:
+  source: "huggingface"
+  name: 'microsoft/swin-tiny-patch4-window7-224'
+  pretrained: true
+  model_type: 'swin'
+  hidden_size: 768
+
+text_decoder:
+  source: "huggingface"
+  name: "emilyalsentzer/Bio_ClinicalBERT"
+  pretrained: true
+  cache_dir: "huggingface/"
+  trust_remote_code: true
+
+  max_length: 256
+  min_length: 128
+  max_prompt_length: 77
+  beam_size: 3
+
+tokenizer:
+  source: "huggingface"
+  pretrained_model_name_or_path: "emilyalsentzer/Bio_ClinicalBERT"
+  cache_dir: "huggingface/tokenizers"
+
+transform:
+  inference:
+    Resize:
+      size: 224
+    CenterCrop:
+      size: 224
+
+prompt_constructor:
+  name: "prompt_constructor"
+  prompt_strategy: "supervised"
+  prompt_file_path: "assets/train_prompts_all.json"
+  use_diverse_templates: false
+
+  optimal_thresholds:
+    "Atelectasis": 0.5
+    "Cardiomegaly": 0.5
+    "Consolidation": 0.5
+    "Edema": 0.5
+    "Enlarged Cardiomediastinum": 0.5
+    "Fracture": 0.5
+    "Lung Lesion": 0.5
+    "Lung Opacity": 0.5
+    "No Finding": 0.5
+    "Pleural Effusion": 0.5
+    "Pleural Other": 0.5
+    "Pneumonia": 0.5
+    "Pneumothorax": 0.5
+    "Support Devices": 0.5
+
+  pretrained_backbone:
+    load_pretrained_weights: "tudormihaita/clip-xrad-finetuned-classifier/checkpoint.tar"
+    freeze_pretrained_weights: true
+
+    image_encoder:
+      source: "huggingface"
+      name: 'microsoft/swin-tiny-patch4-window7-224'
+      pretrained: true
+      model_type: 'swin'
+
+    classifier:
+      config:
+        name: "mlp"
+        hidden_dim: 384
+        n_class: 14
