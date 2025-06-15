@@ -15,9 +15,9 @@ def build_loss(all_loss_config: Dict) -> CombinedLoss:
             continue
         if loss_config == "contrastive_clip":
             loss = ImageTextContrastiveLoss(**cfg)
-        elif loss_config == "contrastive_distribution":
+        elif loss_config == "contrastive_kldiv":
             loss = SemanticDistributionAlignmentLoss(**cfg)
-        elif loss_config == "contrastive_semantic":
+        elif loss_config == "contrastive_mcsl":
             loss = SemanticContrastiveAlignmentLoss(**cfg)
         elif loss_config == "classification":
             loss = ClassificationLoss(**cfg)

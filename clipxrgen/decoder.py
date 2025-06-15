@@ -10,7 +10,7 @@ from .modules import  load_text_decoder, load_pretrained_image_encoder_weights, 
 T = TypeVar("T", bound="Module")
 
 
-class CxrCLIPReportDecoder(nn.Module):
+class CLIPXRGen(nn.Module):
     def __init__(
             self,
             model_config: Dict,

@@ -78,7 +78,7 @@ class ImageTextContrastiveLoss(nn.Module):
 class SemanticContrastiveAlignmentLoss(nn.Module):
     def __init__(self, semantic_temperature=1.0, semantic_weight=0.7, loss_ratio=1.0):
         super(SemanticContrastiveAlignmentLoss, self).__init__()
-        self.name = "contrastive_semantic"
+        self.name = "contrastive_mcsl"
         self.semantic_temperature = semantic_temperature
         self.semantic_weight = semantic_weight
         self.loss_ratio = loss_ratio
@@ -140,7 +140,7 @@ class SemanticContrastiveAlignmentLoss(nn.Module):
 class SemanticDistributionAlignmentLoss(nn.Module):
     def __init__(self, loss_ratio=1.0):
         super(SemanticDistributionAlignmentLoss, self).__init__()
-        self.name = "contrastive_distribution"
+        self.name = "contrastive_kldiv"
         self.loss_ratio = loss_ratio
 
     def forward(self,

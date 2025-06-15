@@ -1,0 +1,64 @@
+{
+  "model_name": "clip2bart",
+  "model_type": "multimodal_bart",
+
+  "vision_encoder": {
+    "freeze_weights": true,
+    "embed_dim": 768
+  },
+
+  "bart_decoder": {
+    "model_name": "facebook/bart-base",
+    "encoder_layers": 0
+  },
+
+  "architecture": {
+    "image_feature_size": 2052,
+    "d_model": 1024,
+    "vocab_size": 50320,
+    "max_position_embeddings": 1024,
+    "encoder_ffn_dim": 4096,
+    "encoder_layers": 12,
+    "encoder_attention_heads": 16,
+    "encoder_layerdrop": 0.0,
+    "decoder_ffn_dim": 4096,
+    "decoder_layers": 12,
+    "decoder_attention_heads": 16,
+    "decoder_layerdrop": 0.0
+  },
+
+  "training": {
+    "activation_dropout": 0.0,
+    "attention_dropout": 0.0,
+    "dropout": 0.1,
+    "classif_dropout": 0.0,
+    "init_std": 0.02
+  },
+
+  "generation": {
+    "max_length": 256,
+    "num_beams": 4,
+    "pad_token_id": 1,
+    "bos_token_id": 0,
+    "eos_token_id": 2,
+    "decoder_start_token_id": 0
+  },
+
+  "special_tokens": {
+    "img_feat_id": 50273,
+    "cls_token_id": 50276
+  },
+
+  "loss_weights": {
+    "lm_loss_factor": 1.0,
+    "mrm_loss_factor": 1.0,
+    "attribute_loss_factor": 1.0,
+    "relation_loss_factor": 1.0
+  },
+
+  "projection": {
+    "dropout_rate": 0.1,
+    "use_layer_norm": true,
+    "activation": "relu"
+  }
+}

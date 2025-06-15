@@ -9,13 +9,12 @@ from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 
-from constants import CHEXPERT_LABELS
 from utils.logger import LoggerManager
 from utils.training_monitor import TrainingMonitor
-from eval.metrics.classification import compute_supervised_classification_metrics
+from eval.metrics.retrieval import compute_retrieval_recall_metrics
 
 
-class CxrClassifierTrainer:
+class ImageTextAlignmentTrainer:
     def __init__(
             self,
             model,
@@ -25,7 +24,7 @@ class CxrClassifierTrainer:
             val_loader=None,
             test_loader=None,
             device='cuda' if torch.cuda.is_available() else 'cpu',
-            output_dir='./output/finetune',
+            output_dir='./output/pretrain',
             mixed_precision=False,
     ):
         self.device = device
@@ -33,7 +32,7 @@ class CxrClassifierTrainer:
         self.model = model.to(self.device)
         self.loss_fn = loss_fn
 
-        self.class_list = CHEXPERT_LABELS
+        self.max_length = self.config.get('max_length', 143)
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -44,6 +43,7 @@ class CxrClassifierTrainer:
         self.warmup_lr = float(self.config.get('warmup_lr', 1e-7))
         self.weight_decay = self.config.get('weight_decay', 0.05)
 
+        self.early_stopping_patience = self.config.get('early_stopping_patience', 5)
         self.warmup_steps = self.config.get('warmup_steps', 1000)
         self.scheduler_type = self.config.get('scheduler_type', 'cosine')
         self.restarts_t_mult = self.config.get('restarts_t_mult', 1)
@@ -63,16 +63,18 @@ class CxrClassifierTrainer:
             self.num_epochs = self.config.get('max_epochs', 10)
             self.max_steps = steps_per_epoch * self.num_epochs
 
-        self.model.train()
-        param_groups = [{'params': [p for n, p in model.named_parameters() if p.requires_grad]}]
-
+        # visual encoder typically learns slower than other components
         self.optimizer = AdamW(
-            param_groups,
+            [
+                {'params': [p for n, p in model.named_parameters() if 'image_encoder' in n], 'lr': self.init_lr * 0.1},
+                {'params': [p for n, p in model.named_parameters() if 'image_encoder' not in n]}
+            ],
             lr=self.init_lr,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.999)
         )
 
+        # initialize learning rate scheduler
         if self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
@@ -94,11 +96,14 @@ class CxrClassifierTrainer:
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float('inf')
-        self.best_auroc = 0.0
+        self.best_r_mean = float('inf')
 
         self.logger = LoggerManager.get_logger(__name__)
-        self.early_stopping_patience = self.config.get('early_stopping_patience', 5)
-        self.train_monitor = TrainingMonitor(self.output_dir, early_stopping_patience=self.early_stopping_patience)
+        self.train_monitor = TrainingMonitor(
+            output_dir=self.output_dir,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_metric='val_loss'
+        )
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -111,7 +116,8 @@ class CxrClassifierTrainer:
             param_group['lr'] = lr
 
     def train(self):
-        self.logger.info("Starting training")
+        self.model.train()
+        self.logger.info("Start training")
 
         for epoch in range(self.num_epochs):
             self.epoch = epoch
@@ -150,21 +156,23 @@ class CxrClassifierTrainer:
                 val_metrics = self.evaluate()
                 val_loss = val_metrics['val_loss']
 
+                early_stop = self.train_monitor.log_metric('val_loss', val_loss, self.global_step + 1)
+
                 if val_metrics['val_loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['val_loss']
                     self.save_checkpoint(is_best=True, suffix='best_loss')
 
-                if val_metrics['auroc_avg'] > self.best_auroc:
-                    self.best_auroc = val_metrics['auroc_avg']
-                    self.save_checkpoint(is_best=True, suffix='best_auroc')
+                if val_metrics['r_mean'] < self.best_r_mean:
+                    self.best_r_mean = val_metrics['r_mean']
+                    self.save_checkpoint(is_best=True, suffix='best_retrieval')
 
-                self.train_monitor.log_metric('accuracy', val_metrics['accuracy_avg'], self.global_step + 1)
-                self.train_monitor.log_metric('auroc_avg', val_metrics['auroc_avg'], self.global_step + 1)
-
-                early_stop = self.train_monitor.log_metric('val_loss', val_loss, self.global_step + 1)
                 if early_stop:
-                    self.logger.info(f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
-                    self.train_monitor.plot_all_metrics()
+                    self.logger.info(
+                        f"No improvement in validation loss for {self.early_stopping_patience} epochs. Stopping training.")
+                    try:
+                        self.train_monitor.plot_all_metrics()
+                    except Exception as e:
+                        self.logger.warning(f"Error generating plots: {e}")
                     break
 
         if self.test_loader is not None:
@@ -174,7 +182,7 @@ class CxrClassifierTrainer:
         try:
             self.train_monitor.plot_all_metrics()
         except Exception as e:
-            self.logger.warning(f"Failed to generate loss plots: {e}")
+            self.logger.warning(f"Error generating plots: {e}")
         self.logger.info("Training completed")
 
     def train_step(self, batch):
@@ -184,7 +192,7 @@ class CxrClassifierTrainer:
         if self.scaler is not None:
             with autocast('cuda'):
                 outputs = self.model(batch, self.device)
-                loss_dict = self.loss_fn(**outputs)
+                loss_dict = self.loss_fn(**outputs, is_train=True)
                 loss = loss_dict['total']
                 scaled_loss = loss / self.gradient_accumulation_steps
 
@@ -202,7 +210,7 @@ class CxrClassifierTrainer:
                     self.scheduler.step()
         else:
             outputs = self.model(batch, self.device)
-            loss_dict = self.loss_fn(**outputs)
+            loss_dict = self.loss_fn(**outputs, is_train=True)
             loss = loss_dict['total']
             scaled_loss = loss / self.gradient_accumulation_steps
 
@@ -226,44 +234,60 @@ class CxrClassifierTrainer:
         phase = "test" if test else "val"
 
         total_loss = 0.0
-        all_predictions, all_labels = [], []
+        uids = []
+        all_texts = []
+        all_labels = []
+        all_image_embeddings = []
+        all_text_embeddings = []
 
         for batch in tqdm(dataloader, desc=f"{phase.capitalize()} Evaluation"):
+            images = batch['images']
+            texts = batch['texts']
+            tokens = batch['text_tokens']
+            labels = batch['labels']
+
+            if 'uid' in batch:
+                uids.extend(batch['uid'])
+
             outputs = self.model(batch, self.device)
             loss_dict = self.loss_fn(**outputs)
             loss = loss_dict['total']
-            total_loss += loss.item()
+            total_loss += loss
 
-            predictions = torch.sigmoid(outputs["cls_pred"]).detach().cpu().numpy()
-            labels = outputs["target_class"].detach().cpu().numpy()
+            img_emb = self.model.encode_image(images.to(self.device))
+            img_emb = self.model.image_projection(img_emb) if self.model.projection else img_emb
+            img_emb = img_emb / torch.norm(img_emb, dim=1, keepdim=True)
+            img_emb = img_emb.detach().cpu().numpy()
 
-            all_predictions.append(predictions)
-            all_labels.append(labels)
+            text_emb = self.model.encode_text(tokens.to(self.device))
+            text_emb = self.model.text_projection(text_emb) if self.model.projection else text_emb
+            text_emb = text_emb / torch.norm(text_emb, dim=1, keepdim=True)
+            text_emb = text_emb.detach().cpu().numpy()
 
-        all_predictions = np.concatenate(all_predictions, axis=0)
-        all_labels = np.concatenate(all_labels, axis=0)
+            all_image_embeddings.append(img_emb)
+            all_text_embeddings.append(text_emb)
+            all_texts.extend(texts)
+            all_labels.append(labels.detach().cpu().numpy())
 
-        class_metrics = compute_supervised_classification_metrics(
-            predictions=all_predictions,
-            labels=all_labels,
-            class_list=self.class_list
-        )
+        all_image_embeddings = np.concatenate(all_image_embeddings)
+        all_text_embeddings = np.concatenate(all_text_embeddings)
 
-        avg_loss = total_loss / len(dataloader)
+        num_batches = len(dataloader)
+        avg_loss = total_loss / num_batches
+        retrieval_metrics = compute_retrieval_recall_metrics(all_image_embeddings, all_text_embeddings, all_texts)
+
         eval_metrics = {
             f"{phase}_loss": avg_loss,
         }
+        eval_metrics.update(retrieval_metrics)
 
-        for k, v in class_metrics['average'].items():
-            eval_metrics[k] = v
+        if not test:
+            for k, v in retrieval_metrics.items():
+                self.train_monitor.log_metric(k, v, self.global_step + 1)
 
-        # for class_name in self.class_list:
-        #     for metric_name, metric_value in class_metrics[class_name].items():
-        #         eval_metrics[f"{phase}_{class_name}_{metric_name}"] = metric_value
+        eval_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in eval_metrics.items()}
+        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(eval_metrics, indent=2)}")
 
-
-        safe_eval_metrics = {k: (v.item() if isinstance(v, (torch.Tensor, np.generic)) else v) for k, v in eval_metrics.items()}
-        self.logger.info(f"{phase.capitalize()} metrics: {json.dumps(safe_eval_metrics, indent=2)}")
         self.model.train()
         return eval_metrics
 
@@ -278,15 +302,15 @@ class CxrClassifierTrainer:
         }
 
         if step is not None:
-            checkpoint_path = os.path.join(self.output_dir, f'clip-xrgen_classifier-ckpt-{step}.tar')
+            checkpoint_path = os.path.join(self.output_dir, f'clip-xrgen-pt_ckpt-{step}.pt')
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         if is_best:
             if suffix:
-                best_path = os.path.join(self.output_dir, f'clip-xrgen-classifier_{suffix}.tar')
+                best_path = os.path.join(self.output_dir, f'clip-xrgen-pt_{suffix}.pt')
             else:
-                best_path = os.path.join(self.output_dir, 'clip-xrgen-classifier_best.tar')
+                best_path = os.path.join(self.output_dir, 'clip-xrgen-pt_best.pt')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model to {best_path}")
 
@@ -295,11 +319,7 @@ class CxrClassifierTrainer:
             self.logger.warning(f"Checkpoint {checkpoint_path} does not exist. Starting from scratch.")
             return
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.global_step = checkpoint['global_step']
-        self.epoch = checkpoint['epoch']
 
         self.logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {self.epoch}, step {self.global_step})")

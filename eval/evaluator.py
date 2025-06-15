@@ -4,7 +4,7 @@ import numpy as np
 from tqdm import tqdm
 
 from data import load_tokenizer
-from cxrclip import build_model
+from clipxrgen import build_model
 from configs import load_config_from_file
 
 from constants import CHEXPERT_LABELS

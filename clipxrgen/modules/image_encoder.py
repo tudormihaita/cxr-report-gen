@@ -27,7 +27,7 @@ class VisionTransformerEncoder(nn.Module):
             if type(model_config).__name__ == "ViTConfig":
                 self.image_encoder = ViTModel(model_config, add_pooling_layer=False)
             else:
-                # TODO: add vision models if needed
+                # add vision models if needed
                 raise NotImplementedError(f"Not support training from scratch : {type(model_config).__name__}")
 
         if gradient_checkpointing and self.image_encoder.supports_gradient_checkpointing:

@@ -5,22 +5,28 @@ from transformers import BartForConditionalGeneration, BartTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from constants import BART_TYPE
 
-class CLIP2BARTModel(nn.Module):
+
+class CLIPBartDecoder(nn.Module):
     def __init__(
             self,
             vision_encoder,
             decoder_model_name=BART_TYPE,
+            config_path=None,
             freeze_clip_encoder=True,
             dropout_rate=0.1
     ):
-        super(CLIP2BARTModel, self).__init__()
+        super(CLIPBartDecoder, self).__init__()
         self.vision_encoder = vision_encoder
 
         self.tokenizer = BartTokenizer.from_pretrained(decoder_model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.bart_decoder = BartForConditionalGeneration.from_pretrained(decoder_model_name)
+        if config_path:
+            bart_config = self.load_bart_config_from_json(config_path)
+            self.bart_decoder = BartForConditionalGeneration(bart_config)
+        else:
+            self.bart_decoder = BartForConditionalGeneration.from_pretrained(decoder_model_name)
         self.bart_decoder.config.encoder_layers = 0
 
         self.image_embed_dim = vision_encoder.embed_dim

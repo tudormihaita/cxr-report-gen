@@ -20,18 +20,6 @@ class VisionBartTrainer:
         max_grad_norm=1.0,
         model_name="facebook/bart-base",
     ):
-        """
-        Custom trainer for XRGenModel.
-
-        :param model (XRGenModel): Your XRGenModel instance.
-        :param tokenizer (AutoTokenizer): Tokenizer matching model.decoder_model_name.
-        :param train_loader (DataLoader): DataLoader with 'image' and 'report' among other keys.
-        :param val_loader (DataLoader, optional): DataLoader for validation (same structure).
-        :param lr (float): Learning rate for AdamW.
-        :param num_epochs (int): Number of training epochs.
-        :param warmup_ratio (float): Fraction of total steps for linear warmup.
-        :param device (str): 'cuda' or 'cpu'.
-        """
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader

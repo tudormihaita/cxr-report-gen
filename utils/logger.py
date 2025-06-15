@@ -5,7 +5,6 @@ class LoggerManager:
 
     @classmethod
     def get_logger(cls, name):
-        """Get or create a logger instance with a given name."""
         if name not in cls._instances:
             logger = cls._build_logger(name)
             cls._instances[name] = logger
@@ -13,7 +12,6 @@ class LoggerManager:
 
     @staticmethod
     def _build_logger(name):
-        """Build a logger instance with the name of a given class."""
         logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)
 

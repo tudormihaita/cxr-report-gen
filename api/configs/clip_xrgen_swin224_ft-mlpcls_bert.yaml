@@ -14,7 +14,7 @@ encoder:
   model:
 #    fine-tuned inference
     name: "finetune_classifier"
-    load_backbone_weights: "assets/checkpoints/clip-xrad-backbone.pt"
+    load_backbone_weights: "models/clip-xrad-backbone-swin224.pt"
     freeze_backbone_weights: true
 
     image_encoder:
@@ -53,11 +53,12 @@ encoder:
 #      name: "linear" # one of { "linear" | "mlp" }
 #      dropout: 0.1
 #      proj_dim: 512
+
   loss:
     classification:
     loss_ratio: 1.0
 
-    contrastive_semantic:
+    contrastive_mcsl:
       semantic_temperature: 1.0
       semantic_weight: 0.7
       loss_ratio: 1.0
@@ -65,7 +66,7 @@ encoder:
 decoder:
   model:
     name: "downstream_decoder"
-    load_backbone_weights: "assets/checkpoints/clip-xrad-classifier.tar"
+    load_backbone_weights: "models/clip-xrad-classifier-mlp.tar"
     freeze_backbone_weights: true
 
     image_encoder:

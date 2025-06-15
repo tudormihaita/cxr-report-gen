@@ -1,4 +1,6 @@
+import os
 import io
+import env
 import time
 import logging
 from typing import Optional
@@ -9,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from pipeline import CLIPXRGenPipeline
-from api import MODEL_PATH, CONFIG_PATH
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -33,8 +34,8 @@ class ReportResponse(BaseModel):
 
 
 pipeline = CLIPXRGenPipeline.from_pretrained(
-    model_path=MODEL_PATH,
-    config_path=CONFIG_PATH,
+    model_path=os.getenv("MODEL_PATH"),
+    config_path=os.getenv("CONFIG_PATH"),
 )
 
 

@@ -6,7 +6,7 @@ from .modules import load_image_classifier, load_image_encoder, load_pretrained_
 T = TypeVar("T", bound="Module")
 
 
-class CxrCLIPClassifier(nn.Module):
+class CLIPXRadClassifier(nn.Module):
     def __init__(self, model_config: Dict, model_type: str = "vit"):
         super().__init__()
         self.model_type = model_type

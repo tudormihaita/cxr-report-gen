@@ -10,7 +10,7 @@ from .modules import load_image_encoder, load_projection_head, load_text_encoder
 
 log = LoggerManager.get_logger(__name__)
 
-class CxrCLIP(nn.Module):
+class CLIPXRad(nn.Module):
     def __init__(self, model_config: Dict, all_loss_config: Dict, tokenizer: PreTrainedTokenizer = None):
         super().__init__()
         self.tokenizer = tokenizer

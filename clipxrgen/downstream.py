@@ -18,7 +18,7 @@ bleu = evaluate.load("bleu")
 rouge = evaluate.load("rouge")
 
 
-class CxrDecoderTrainer:
+class RadiologyReportDecoderTrainer:
     def __init__(
             self,
             model,

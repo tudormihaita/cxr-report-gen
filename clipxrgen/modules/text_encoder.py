@@ -37,7 +37,7 @@ class BertTextEncoder(nn.Module):
             if type(model_config).__name__ == "BertConfig":
                 self.text_encoder = BertModel(model_config)
             else:
-                # TODO: add text models if needed
+                # add text models if needed
                 raise NotImplementedError(f"Not support training from scratch : {type(model_config).__name__}")
 
         if gradient_checkpointing and self.text_encoder.supports_gradient_checkpointing:

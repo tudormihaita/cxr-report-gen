@@ -1,5 +1,4 @@
 import os
-import re
 import logging
 import numpy as np
 import pandas as pd
@@ -46,12 +45,6 @@ class IUXrayPreprocessor:
         self.iu_xray = self.iu_xray.merge(self.annotations, on="uid", how="left")
 
     def _assign_splits(self) -> None:
-        """
-        Assign train, validation and test splits to the dataset using stratified sampling based on the labels.
-        The dataset is split into 5 folds, and then the first fold is used for training, the second for validation,
-        and the third for testing.
-        Percentages:
-        """
         X = self.iu_xray[['uid']]
         Y = self.iu_xray[CHEXPERT_LABELS].replace(-1, 0).values
 

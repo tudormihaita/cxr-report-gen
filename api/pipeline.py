@@ -5,7 +5,7 @@ from typing import Union, Optional, Dict, List, Any
 import torch
 from PIL import Image
 
-from cxrclip import build_model
+from clipxrgen import build_model
 from configs import load_config_from_file
 from data import load_tokenizer, load_transform, transform_image
 
