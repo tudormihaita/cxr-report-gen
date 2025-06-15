@@ -97,9 +97,6 @@ def compute_rouge_scores(
         references: List[str],
         rouge_types: Optional[List[str]] = None
 ) -> Dict[str, float]:
-    """
-    Compute ROUGE scores for text generation.
-    """
     if rouge is None:
         raise RuntimeError("ROUGE metric not available")
 
@@ -128,9 +125,6 @@ def compute_meteor_score(
         predictions: List[str],
         references: List[str]
 ) -> Dict[str, float]:
-    """
-    Compute METEOR score for text generation.
-    """
     if meteor is None:
         raise RuntimeError("METEOR metric not available")
 
@@ -148,9 +142,6 @@ def compute_bertscore(
         model_type: str = "emilyalsentzer/Bio_ClinicalBERT",
         device: Optional[str] = None
 ) -> Dict[str, float]:
-    """
-    Compute BERTScore for text generation.
-    """
     if bertscore is None:
         print("Warning: BERTScore not available, skipping")
         return {"bertscore_precision": 0.0, "bertscore_recall": 0.0, "bertscore_f1": 0.0}

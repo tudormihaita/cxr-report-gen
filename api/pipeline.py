@@ -139,16 +139,4 @@ class CLIPXRGenPipeline:
             "config": self.config
         }
 
-if __name__ == "__main__":
-    from api import CONFIG_PATH
-    pipeline = CLIPXRGenPipeline.from_pretrained(
-        config_path=CONFIG_PATH,
-    )
-
-    model = pipeline.model
-    print("Same image encoder?", model.image_encoder is model.prompt_constructor.image_encoder)
-
-    img_enc_param1 = next(model.image_encoder.parameters())
-    prompt_img_enc_param1 = next(model.prompt_constructor.image_encoder.parameters())
-    print("Same weights?", torch.equal(img_enc_param1, prompt_img_enc_param1))
 

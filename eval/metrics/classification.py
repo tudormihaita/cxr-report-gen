@@ -19,9 +19,6 @@ def compute_supervised_classification_metrics(
         class_list: List[str],
         threshold: float = 0.5,
 ) -> Dict:
-    """
-    Compute classification metrics from model predictions (probabilities).
-    """
     if isinstance(predictions, torch.Tensor):
         predictions = predictions.detach().cpu().numpy()
     if isinstance(labels, torch.Tensor):
@@ -87,9 +84,6 @@ def compute_supervised_classification_with_optimal_thresholds(
         labels: Union[torch.Tensor, np.ndarray],
         class_list: List[str],
 ) -> Dict:
-    """
-    Compute supervised classification metrics with optimal thresholds per class.
-    """
     # Convert to numpy if needed
     if isinstance(predictions, torch.Tensor):
         predictions = predictions.detach().cpu().numpy()
@@ -319,9 +313,6 @@ def find_optimal_thresholds_per_class(
         labels: np.ndarray,
         class_list: List[str],
 ) -> Dict[str, float]:
-    """
-    Find optimal decision thresholds for each class using Youden's J statistic.
-    """
     optimal_thresholds = {}
 
     for i, class_name in enumerate(class_list):
@@ -436,9 +427,6 @@ def plot_roc_curves(
         figsize: Tuple[int, int] = (15, 12),
         ncols: int = 3
 ) -> plt.Figure:
-    """
-    Plot ROC curves for specified classes in a grid layout.
-    """
     if isinstance(predictions, torch.Tensor):
         predictions = predictions.detach().cpu().numpy()
     if isinstance(labels, torch.Tensor):

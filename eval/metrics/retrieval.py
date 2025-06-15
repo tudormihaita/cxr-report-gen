@@ -15,9 +15,6 @@ def compute_retrieval_recall_metrics(
         text_embeddings: np.ndarray,
         text_list: List[str],
 ) -> Dict:
-    """
-    Compute image-to-text retrieval metrics as recall@1, recall@5, recall@10 and mean rank.
-    """
     identical_text_set = []
     idx2label = {}
     identical_indexes = []
@@ -64,13 +61,6 @@ def compute_retrieval_precision_metrics(
         labels: np.ndarray,
         class_indices: Optional[List[int]] = None,
 ) -> Dict:
-    """
-    Compute class-based Precision@K retrieval metrics over the entire dataset.
-
-    For each query image, retrieves the top-K most similar texts and computes
-    the precision as the fraction of retrieved texts that share at least one
-    positive class label with the query image.
-    """
     n_samples = len(image_embeddings)
     similarities = metrics.pairwise.cosine_similarity(image_embeddings, text_embeddings)
 
@@ -126,13 +116,6 @@ def compute_retrieval_precision_metrics_per_class(
         class_names: List[str] = CHEXPERT_LABELS,
         class_indices: Optional[List[int]] = None
 ) -> Dict:
-    """
-    Compute class-based Precision@K retrieval metrics per individual class.
-
-    For each class, considers only query images that have that class as positive,
-    and computes precision as the fraction of retrieved texts that also have
-    that class as positive.
-    """
     n_samples, n_classes = labels.shape
     similarities = metrics.pairwise.cosine_similarity(image_embeddings, text_embeddings)
 
@@ -214,9 +197,6 @@ def compute_retrieval_precision_metrics_fixed_pool(
         samples_per_class: int = 200,
         random_seed: int = 42
 ) -> Dict:
-    """
-    Compute category-based Precision@K retrieval metrics.
-    """
     if class_indices is not None:
         if max(class_indices) >= labels.shape[1]:
             raise ValueError(
@@ -283,9 +263,6 @@ def compute_retrieval_recall_metrics_fixed_pool(image_embeddings: np.ndarray,
                                                 pool_size: int = 1000,
                                                 use_balanced_sampling: bool = True,
                                                 random_seed: int = 42) -> Dict:
-    """
-    Compute image-to-text retrieval metrics with fixed gallery size.
-    """
     if use_balanced_sampling and labels is not None and class_names is not None:
         pool_img_emb, pool_txt_emb, pool_texts, pool_indices = sample_balanced_pool(
             image_embeddings, text_embeddings, text_list, labels, class_names,

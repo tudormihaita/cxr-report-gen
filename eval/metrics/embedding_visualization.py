@@ -18,7 +18,6 @@ def compute_tsne_embedding_visualization(
         show_individual_plots: bool = False,
         random_seed: int = 42
 ) -> Dict:
-    """Create t-SNE visualization of image embeddings."""
     if selected_classes is not None:
         class_indices = [i for i, label in enumerate(class_labels) if label in selected_classes]
         labels_filtered = labels[:, class_indices]
@@ -146,9 +145,6 @@ def compute_tsne_embedding_visualization(
 
 
 def compute_clustering_metrics(tsne_coords: np.ndarray, labels: np.ndarray, class_labels: List[str]) -> Dict:
-    """
-    Compute clustering quality metrics for the t-SNE embedding.
-    """
     metrics = {}
 
     for i, finding_name in enumerate(class_labels):

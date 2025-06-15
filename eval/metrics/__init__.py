@@ -16,9 +16,6 @@ def sample_balanced_pool(image_embeddings: np.ndarray,
                             pool_size: int = 1000,
                             min_samples_per_class: int = 10,
                             random_seed: int = 42) -> Tuple[np.ndarray, np.ndarray, List[str], List[int]]:
-    """
-    Sample a balanced pool for retrieval evaluation with fixed size.
-    """
     random.seed(random_seed)
     np.random.seed(random_seed)
     n_samples = len(image_embeddings)
@@ -110,10 +107,6 @@ def sample_balanced_category_pool(
         samples_per_class: int = 200,
         random_seed: int = 42
 ):
-    """
-    For each class, sample up to samples_per_class image indices with that class,
-    and for each, store the image embedding, text embedding, caption, and the category it was sampled for.
-    """
     np.random.seed(random_seed)
 
     # build mapping from each class to all samples that have that class
